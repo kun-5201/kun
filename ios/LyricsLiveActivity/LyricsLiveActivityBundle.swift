@@ -172,38 +172,43 @@ struct LyricsLiveActivity: Widget {
                             .foregroundStyle(context.state.isLiked ? .red : .primary)
                             Spacer()
                         }
-                        // #59 diagnostic: "·59" proves the new extension
-                        // is rendering; the session tag (activity start
-                        // time "HHmm") proves WHICH activity — a stale
-                        // leftover shows an old time, a live one the
-                        // current session's start. No tag at all means
-                        // the device still runs a pre-#59 extension.
+                        // #60 diagnostic: "·60" (compact pill) and "扩展 v60"
+                        // prove the new extension is rendering; the session
+                        // tag (activity start time "HHmm") proves WHICH
+                        // activity — a stale leftover shows an old time, a
+                        // live one the current session's start. No tag at
+                        // all means the device still runs a pre-#60 extension.
                         // (Remove once the root cause is confirmed.)
-                        Text("扩展 v59 · \(context.state.isPlaylistMode ? "歌单" : "歌词") · 歌词\(context.state.currentLine == nil ? "无" : "有") · 封面\(context.state.coverURL == nil ? "无" : "有") · 活动 \(context.state.sessionTag ?? "无")")
+                        Text("扩展 v60 · \(context.state.isPlaylistMode ? "歌单" : "歌词") · 歌词\(context.state.currentLine == nil ? "无" : "有") · 封面\(context.state.coverURL == nil ? "无" : "有") · 活动 \(context.state.sessionTag ?? "无")")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
             } compactLeading: {
-                // #59: the pill line must never be blank without
-                // explanation. Lyric mode → the real line (title while
-                // lyrics load, never a lone ♪, never blank); playlist
-                // mode (lyrics off) → the scrolling hint "长按开启歌词"
-                // (the song title lives in the expanded view). A blank
-                // pill therefore proves the extension is not running at
-                // all (system placeholder), while any text proves it is.
-                // "·59" proves the new extension code is the one
-                // rendering; the session tag (activity start time "HHmm")
-                // proves WHICH activity — a stale leftover shows an old
-                // time, a live one the current session's start. No tag at
-                // all means the device still runs a pre-#59 extension.
-                // MarqueeText scrolls a too-long line right-to-left in a
-                // loop (Kugou) instead of truncating it to a few chars.
-                // Tapping the pill opens kun to the player.
-                MarqueeText(
-                    text: compactLine(state: context.state) + " ·59" + (context.state.sessionTag.map { " \($0)" } ?? ""),
-                    color: Color(hex: context.state.lyricColorHex)
-                )
+                // #60: the pill shows EXACTLY 3 characters of the lyric,
+                // complete, SCROLLING (never static). #59's point marquee
+                // (GeometryReader + TimelineView 0.05s + .offset) froze
+                // mid-scroll on device and showed a 1–2 char slice
+                // ("我入怀中）", "9（", no ·59 — 05:46 screenshots).
+                // Marquee3Char scrolls by CHARACTER (3-char window, 1
+                // char/s, TimelineView 1s), so 3 complete chars are
+                // always visible and nothing is cut mid-character. The
+                // "·60" marker is a SEPARATE non-scrolling Text, so it
+                // is always visible and proves the new extension is
+                // rendering; the session tag stays in the expanded
+                // diagnostic only. Lyric mode → the real line (title
+                // while lyrics load, never a lone ♪, never blank);
+                // playlist mode (lyrics off) → the scrolling hint
+                // "长按开启歌词". Tapping the pill opens kun to the player.
+                HStack(spacing: 4) {
+                    Marquee3Char(
+                        text: compactLine(state: context.state),
+                        color: Color(hex: context.state.lyricColorHex)
+                    )
+                    Text("·60")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 .widgetURL(URL(string: "kumone://now-playing")!)
             } compactTrailing: {
                 // #54: synchronous thumbnail only — the async loader broke
@@ -217,13 +222,14 @@ struct LyricsLiveActivity: Widget {
                 // #59: the user wants the lyric in the minimal view too.
                 // Minimal holds exactly one element; the lyric wins over
                 // the cover (the 04:43 screenshot's right pill was the
-                // minimal view showing cover only, no lyric). Same line +
-                // "·59" + session tag as compactLeading, so a minimized
-                // pill still proves which extension and which activity.
-                // MarqueeText scrolls a too-long line instead of
-                // truncating it. Tapping opens the player.
-                MarqueeText(
-                    text: compactLine(state: context.state) + " ·59" + (context.state.sessionTag.map { " \($0)" } ?? ""),
+                // minimal view showing cover only, no lyric). Same
+                // 3-char scrolling window as compactLeading. The "·60"
+                // marker is NOT here — minimal holds exactly one
+                // element and the lyric is the priority; the marker is
+                // proven by compactLeading + the expanded diagnostic.
+                // Tapping opens the player.
+                Marquee3Char(
+                    text: compactLine(state: context.state),
                     color: Color(hex: context.state.lyricColorHex)
                 )
                 .widgetURL(URL(string: "kumone://now-playing")!)
@@ -441,57 +447,85 @@ private func compactLine(state: LyricsLiveActivityAttributes.ContentState) -> St
     return pillLine(state: state)
 }
 
-/// Scrolling (marquee) single-line text for the compact pill / minimal view.
-/// Kugou scrolls a too-long line right-to-left in a loop so the whole line
-/// is readable instead of truncating to a few characters. The scroll is
-/// driven by TimelineView (an extension-side clock), NOT by a SwiftUI
-/// animation and NOT by app pushes: Live Activity compact views may not run
-/// continuous animations, and pushing a new ContentState every frame would
-/// burn the update budget. TimelineView re-renders this view on its own
-/// schedule; the offset is a pure function of the current time, so it moves
-/// whenever the view is on screen. A line that fits does not scroll.
-/// Cycle: 1s pause at the start, scroll left at ~30 pt/s, 1s pause at the
-/// end, jump back to the start and loop.
-struct MarqueeText: View {
+/// #60: scrolling (marquee) lyric for the compact pill / minimal view,
+/// showing EXACTLY 3 characters, complete, SCROLLING (never static).
+/// #59's MarqueeText scrolled by POINTS (GeometryReader + TimelineView
+/// 0.05s + .offset): on device it froze mid-scroll and showed an
+/// arbitrary 1–2 char slice ("我入怀中）", "9（", no ·59 — 05:46
+/// screenshots). Why, read from the code + the screenshots:
+/// - TimelineView 0.05s (20 fps) does not animate in a Live Activity
+///   extension — WidgetKit throttles widget re-renders, so the offset
+///   froze at a pseudo-random phase from render time; the visible
+///   window was a random slice, not the line start (the closing "）"
+///   in "我入怀中）" proves it is a mid-line slice, not a line start).
+/// - GeometryReader has no intrinsic size; in the content-sized compact
+///   regions it can collapse, narrowing the visible window further.
+/// - The "·59" marker + session tag sat at the END of the scrolling
+///   string, so any nonzero offset pushed them off-screen.
+///
+/// This version scrolls by CHARACTER, not by point:
+/// - The display string is sliced into grapheme clusters; the view
+///   shows a window of exactly 3 characters, advancing 1 char per
+///   second (TimelineView 1s cadence — the rate Live Activities can
+///   actually honor), pausing 1s at the start and 1s at the end, then
+///   jumping back to the start. At every moment exactly 3 complete
+///   characters are visible; nothing is ever cut mid-character.
+/// - No GeometryReader (no width to measure — the window is counted
+///   in characters), no .offset, no .clipped: the rendered Text IS
+///   exactly 3 characters, so it cannot be pushed off-screen.
+/// - A line of ≤3 characters does not scroll (it already fits).
+/// - The "·60" marker is a SEPARATE non-scrolling Text next to the
+///   marquee (compactLeading), so it is always visible.
+/// If TimelineView 1s still does not tick in the compact pill on
+/// device, the next round drives the window from app-side pushes
+/// (stated honestly: this build cannot prove motion on the VM).
+struct Marquee3Char: View {
     var text: String
     var color: Color
-    /// Pill font (footnote semibold), shared by the renderer and the
-    /// width measurement so the two agree.
-    var uiFont: UIFont = .systemFont(
-        ofSize: UIFont.preferredFont(forTextStyle: .footnote).pointSize,
-        weight: .semibold)
-    /// Scroll speed, pt per second (Kugou-like).
-    var speed: CGFloat = 30
+    /// Characters visible at once (the user pinned this: 3).
+    var windowSize: Int = 3
+    /// Seconds per step (1 char). 1s is the cadence Live Activities
+    /// can actually honor; 0.05s (#59) was throttled/frozen.
+    var stepSeconds: TimeInterval = 1.0
 
     var body: some View {
-        GeometryReader { proxy in
-            TimelineView(.periodic(from: .now, by: 0.05)) { timeline in
-                let textWidth = (text as NSString)
-                    .size(withAttributes: [.font: uiFont]).width
-                let overflow = max(0, textWidth - proxy.size.width)
-                let offset = Self.offset(
-                    at: timeline.date, overflow: overflow, speed: speed)
-                Text(text)
-                    .font(Font(uiFont))
-                    .foregroundStyle(color)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .offset(x: offset)
-            }
+        TimelineView(.periodic(from: .now, by: stepSeconds)) { timeline in
+            Text(Self.window(
+                text: text, at: timeline.date,
+                windowSize: windowSize, stepSeconds: stepSeconds))
+                .font(.footnote)
+                .fontWeight(.semibold)
+                .foregroundStyle(color)
+                .lineLimit(1)
         }
-        .clipped()
     }
 
-    /// Horizontal offset for a given moment. A pure function of time, so
-    /// the scroll is continuous across view re-renders.
-    static func offset(at date: Date, overflow: CGFloat, speed: CGFloat) -> CGFloat {
-        guard overflow > 0 else { return 0 }
-        let scrollDuration = overflow / speed
-        let cycle = 1.0 + scrollDuration + 1.0
-        let t = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycle)
-        if t < 1.0 { return 0 }
-        if t < 1.0 + scrollDuration { return -(t - 1.0) * speed }
-        return -overflow
+    /// The 3-char window visible at a moment. Pure function of time,
+    /// so the scroll is continuous across view re-renders.
+    static func window(
+        text: String, at date: Date,
+        windowSize: Int, stepSeconds: TimeInterval
+    ) -> String {
+        let clean = text.replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        let chars = Array(clean)
+        guard chars.count > windowSize else { return clean }
+        // Windows: 0 ..< (count - windowSize + 1). The cycle adds a 1s
+        // pause at the end (repeat the last window) and a 1s pause at
+        // the start (repeat the first window across the cycle boundary),
+        // then jumps back to the start.
+        let windows = chars.count - windowSize + 1
+        let cycle = windows + 2
+        let step = Int(date.timeIntervalSinceReferenceDate / stepSeconds) % cycle
+        let start: Int
+        if step < windows {
+            start = step
+        } else if step == windows {
+            start = windows - 1 // end pause
+        } else {
+            start = 0 // start pause (also shown at step 0 of next cycle)
+        }
+        return String(chars[start..<(start + windowSize)])
     }
 }
 
