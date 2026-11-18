@@ -1,0 +1,120 @@
+# XcodeGen manifest for the iOS app shell.
+# Regenerate the project with: cd ios && xcodegen generate
+name: KumoneIOS
+options:
+  deploymentTarget:
+    iOS: "16.2"
+  createIntermediateGroups: true
+configs:
+  Debug: debug
+  Release: release
+  # Release plus App Store Connect signing, no sideload updater, CarPlay when
+  # configured. Selected with `-configuration TestFlight` by Scripts/testflight.sh.
+  TestFlight: release
+configFiles:
+  Debug: Config/Debug.xcconfig
+  Release: Config/Release.xcconfig
+  TestFlight: Config/TestFlight.xcconfig
+packages:
+  KumoneIOSPackage:
+    path: KumoneIOSPackage
+targets:
+  KumoneIOS:
+    type: application
+    platform: iOS
+    sources:
+      - KumoneIOS
+      - path: ../Sources/Kumone/Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - path: ../Sources/Kumone/Resources
+        excludes:
+          - PrivacyInfo.xcprivacy
+        buildPhase: resources
+    configFiles:
+      Debug: Config/Debug.xcconfig
+      Release: Config/Release.xcconfig
+      TestFlight: Config/TestFlight.xcconfig
+    dependencies:
+      - package: KumoneIOSPackage
+        product: KumoneIOSFeature
+      - target: LyricsLiveActivity
+    settings:
+      base:
+        # CODE_SIGN_ENTITLEMENTS is deliberately NOT set here. Target-level build
+        # settings override xcconfig, which would pin the entitlements file and
+        # silently defeat the CarPlay overlay in Config/Shared.xcconfig. The
+        # setting lives there instead, behind $(KUMONE_ENTITLEMENTS_FILE).
+        ENABLE_PREVIEWS: YES
+  LyricsLiveActivity:
+    type: app-extension
+    platform: iOS
+    bundleId: sb.moe.kumone-ios.LyricsLiveActivity2
+    # #59: the "2" is deliberate, not a typo. iOS (SpringBoard) caches a
+    # widget extension by bundle ID and never reloaded the old one:
+    # #54/#57's new code (·54/·57 markers, sync pill, session tag) never
+    # appeared in any user screenshot even after a version bump (#55,
+    # build 5 → 6). A new bundle ID makes the system treat this as a
+    # brand-new extension and load it fresh from disk; the old
+    # extension's activities are orphaned (and the app ends leftovers
+    # on launch). The app never references this ID (it requests
+    # Activity<LyricsLiveActivityAttributes>, matched by attributes
+    # type), and the App Group is unchanged, so nothing else moves.
+    sources:
+      - LyricsLiveActivity
+    info:
+      path: LyricsLiveActivity/Info.plist
+      # NOTE: `xcodegen generate` OVERWRITES the file at info.path with its
+      # generated defaults (FileWriter.writePlists + InfoPlistGenerator) on
+      # every build, so hand-editing LyricsLiveActivity/Info.plist in the repo
+      # does NOT survive to the build — that is why NSExtension kept vanishing
+      # from the built .appex (#38, #39). The ONLY keys that survive are the
+      # generated defaults plus these `properties`, which XcodeGen merges on
+      # top when it rewrites the file. So the extension point declaration and
+      # the display name must live here, not only in the plist file.
+      properties:
+        CFBundleDisplayName: 歌词灵动岛
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    configFiles:
+      Debug: Config/Extension.xcconfig
+      Release: Config/Extension.xcconfig
+      TestFlight: Config/Extension.xcconfig
+    dependencies:
+      - package: KumoneIOSPackage
+        product: KumoneCore
+    settings:
+      base:
+        PRODUCT_NAME: LyricsLiveActivity
+        CODE_SIGN_ENTITLEMENTS: LyricsLiveActivity/LyricsLiveActivity.entitlements
+        # Must be NO (inline, so it beats XcodeGen's generated YES): with
+        # YES, Xcode generates the Info.plist from build settings and ignores
+        # LyricsLiveActivity/Info.plist, dropping the NSExtension entry the
+        # widget extension needs. With NO, the source plist (which declares
+        # com.apple.widgetkit-extension) is used as-is.
+        GENERATE_INFOPLIST_FILE: NO
+  KumoneIOSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - KumoneIOSUITests
+    configFiles:
+      Debug: Config/Tests.xcconfig
+      Release: Config/Tests.xcconfig
+      TestFlight: Config/Tests.xcconfig
+    dependencies:
+      - target: KumoneIOS
+schemes:
+  KumoneIOS:
+    build:
+      targets:
+        KumoneIOS: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - KumoneIOSUITests
+    archive:
+      config: Release

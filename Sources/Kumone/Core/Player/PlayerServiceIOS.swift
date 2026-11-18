@@ -1,0 +1,1911 @@
+#if os(iOS)
+import Combine
+import AVFoundation
+import Foundation
+
+enum RepeatMode: String, CaseIterable {
+    case off, all, one
+
+    var next: RepeatMode {
+        switch self {
+        case .off: return .all
+        case .all: return .one
+        case .one: return .off
+        }
+    }
+}
+
+/// Where the current queue came from — used for scrobbling and UI affordances.
+enum PlaySource: Codable, Equatable {
+    case playlist(Int)
+    case album(Int)
+    case artist(Int)
+    case daily
+    case cloud
+    case none
+
+    var sourceID: Int {
+        switch self {
+        case .playlist(let id), .album(let id), .artist(let id): return id
+        default: return 0
+        }
+    }
+}
+
+/// Where playback started from — listed under "Recently Played" in the Dock
+/// menu, where picking one reloads it and starts playing again.
+///
+/// This is deliberately separate from `PlaySource`: heartbeat mode plays out
+/// of the liked-songs playlist for scrobbling purposes, but as a *place* it is
+/// its own thing, and the recents page has no source at all.
+struct PlayContext: Codable, Hashable {
+    enum Kind: String, Codable {
+        /// Reloaded by id.
+        case playlist, album, artist
+        /// Fixed per-account entry points, each reloaded from its own API.
+        case daily, cloud, recents, heartbeat, fm
+        /// Search results are an ad-hoc list, not a reloadable place.
+        case search
+    }
+
+    let kind: Kind
+    /// Zero for the fixed entry points, which have no id of their own.
+    let id: Int
+    let name: String
+
+    static func playlist(id: Int, name: String) -> PlayContext {
+        .init(kind: .playlist, id: id, name: name)
+    }
+
+    static func album(id: Int, name: String) -> PlayContext {
+        .init(kind: .album, id: id, name: name)
+    }
+
+    static func artist(id: Int, name: String) -> PlayContext {
+        .init(kind: .artist, id: id, name: name)
+    }
+
+    static var daily: PlayContext { .init(kind: .daily, id: 0, name: String(localized: "每日推荐")) }
+    static var cloud: PlayContext { .init(kind: .cloud, id: 0, name: String(localized: "音乐云盘")) }
+    static var recents: PlayContext { .init(kind: .recents, id: 0, name: String(localized: "最近播放")) }
+    static var heartbeat: PlayContext { .init(kind: .heartbeat, id: 0, name: String(localized: "心动模式")) }
+    static var fm: PlayContext { .init(kind: .fm, id: 0, name: String(localized: "私人漫游")) }
+    static var search: PlayContext { .init(kind: .search, id: 0, name: String(localized: "搜索")) }
+
+    /// Identity is the place, not its current title — a renamed playlist is
+    /// still the same entry in the recents list.
+    static func == (lhs: PlayContext, rhs: PlayContext) -> Bool {
+        lhs.kind == rhs.kind && lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(id)
+    }
+}
+
+enum RightPanel {
+    case lyrics, queue
+}
+
+/// The playback engine: queue, shuffle/repeat, personal FM, URL resolution,
+/// lyrics, scrobbling. Modeled on YesPlayMusic's Player class, backed by AVPlayer.
+/// High-frequency playback position, isolated so per-tick updates only
+/// re-render the scrubbers/lyrics that observe it — not every view holding
+/// the PlayerService.
+@MainActor
+final class PlaybackClock: ObservableObject {
+    @Published var progress: TimeInterval = 0
+}
+
+/// Which lyric line is current.
+///
+/// Every lyric view used to derive this itself, which meant observing the clock
+/// and re-rendering on every tick just to discover the line hadn't changed —
+/// and for the now-playing page, whose body is the whole immersive layout, that
+/// was five full re-evaluations a second. Computing it once here and publishing
+/// only on a change turns that into one re-render per lyric line.
+@MainActor
+final class LyricsCursor: ObservableObject {
+    @Published var activeIndex: Int?
+}
+
+@MainActor
+final class PlayerService: ObservableObject {
+    static let shared = PlayerService()
+
+    // MARK: - Observable state
+
+    @Published private(set) var queue: [Track] = []
+    @Published private(set) var shuffledQueue: [Track] = []
+    @Published private(set) var playNextList: [Track] = []
+    @Published private(set) var currentIndex = -1
+    @Published private(set) var currentTrack: Track?
+    private var playbackAccountID: Int?
+    @Published private(set) var source: PlaySource = .none
+    @Published private(set) var isPlaying = false
+    @Published private(set) var isBuffering = false
+    /// Last 0.2s time-observer tick (#50): the island manager reads it in
+    /// the heartbeat to tell a stalled player (time frozen, no ticks) from
+    /// a healthy one. Cleared in pause() so a long user pause followed by
+    /// resume does not log a bogus "tick resumed" gap — only a gap that
+    /// happened while playing (suspension / stall) is real.
+    private(set) var lastPlayerTickAt: Date?
+    @Published private(set) var duration: TimeInterval = 0
+    @Published private(set) var servedQuality: String?
+    @Published private(set) var thirdPartySource: String?
+    @Published private(set) var isTrial = false
+    let clock = PlaybackClock()
+    let lyricsCursor = LyricsCursor()
+    let sleepTimer = SleepTimer()
+    /// Passthrough to the clock so existing `progress` reads/writes keep working.
+    var progress: TimeInterval {
+        get { clock.progress }
+        set { clock.progress = newValue }
+    }
+    @Published var repeatMode: RepeatMode = .off {
+        didSet { UserDefaults.standard.set(repeatMode.rawValue, forKey: "player.repeat") }
+    }
+
+    @Published private(set) var shuffleEnabled = false
+    @Published var volume: Float = 1 {
+        didSet {
+            engine.volume = volume
+            UserDefaults.standard.set(volume, forKey: "player.volume")
+        }
+    }
+
+    @Published private(set) var isFMMode = false
+    @Published private(set) var fmUpcoming: [Track] = []
+    /// Where playback was most recently started from, newest first —
+    /// surfaced as "Recently Played" in the Dock menu.
+    @Published private(set) var recentContexts: [PlayContext] = []
+    @Published private(set) var lyrics: ParsedLyrics?
+    @Published var activePanel: RightPanel?
+    @Published var showNowPlaying = false
+
+    /// The list the player is walking through (shuffled or ordered).
+    var activeQueue: [Track] { shuffleEnabled ? shuffledQueue : queue }
+
+    var upcomingTracks: [Track] {
+        guard !activeQueue.isEmpty, currentIndex >= 0 else { return playNextList }
+        let rest = activeQueue.suffix(from: min(currentIndex + 1, activeQueue.count))
+        return playNextList + Array(rest.prefix(200))
+    }
+
+    var hasCurrentTrack: Bool { currentTrack != nil }
+
+    // MARK: - Engine
+
+    private let engine = AVPlayer()
+    private var lastPlaybackCheckpoint = ContinuousClock.now
+
+    /// Live playback position straight from the player, for smooth per-frame
+    /// karaoke highlighting (the published `progress` is intentionally coarse).
+    var livePlaybackTime: TimeInterval {
+        let t = engine.currentTime().seconds
+        return t.isFinite ? t : progress
+    }
+    private var timeObserver: Any?
+    private var endObserver: NSObjectProtocol?
+    private var audioResourceLoader: CachingAudioResourceLoader?
+    private var pendingAudioResourceLoader: CachingAudioResourceLoader?
+    private var audioCacheLease: UUID?
+    private var statusObservation: NSKeyValueObservation?
+    private var itemStatusObservation: NSKeyValueObservation?
+    private var resolveGeneration = 0
+    /// Pending lyrics refetch after a network failure (see loadLyrics).
+    /// Cancelled on every track change in startPlaying; a stale retry
+    /// never fires thanks to its generation / track / isPlaying guards.
+    private var lyricsRetryTask: Task<Void, Never>?
+    /// Network-error refetches spent for the current track.
+    private var lyricsRetryCount = 0
+    /// A network failure is retried after 10s, at most 3 times per track.
+    /// A definitive "no lyrics anywhere" is never retried.
+    private static let lyricsRetryDelay: TimeInterval = 10
+    private static let lyricsRetryMaxAttempts = 3
+    private var consecutiveFailures = 0
+    private var currentThirdPartyPlatform: String?
+    /// Why the last third-party resolution failed, so the unplayable toast
+    /// can say more than just "VIP 专属".
+    private var lastThirdPartyFailure: String?
+    /// The URL the last successful LX resolution returned, so a later item
+    /// failure can retry with it excluded instead of resolving the same
+    /// dead URL again. Reset per track in startPlaying.
+    private var lastThirdPartyURL: URL?
+    /// LX URLs that already failed to play for the current track. Passed as
+    /// exclusions on retry so each attempt resolves a different candidate.
+    /// Reset per track in startPlaying.
+    private var failedThirdPartyURLs = Set<String>()
+    /// The resolve generation that already spent its one reload after a
+    /// failed item, so a reload that fails too gives up instead of looping.
+    private var itemRetryGeneration: Int?
+    /// Set when a failure skips to the next song, so that skip keeps counting
+    /// toward the stop after five in a row instead of resetting it.
+    private var advancingAfterFailure = false
+    private var scrobbled = false
+    private var startScrobbled = false
+
+    // MARK: - Offline playback (downloads)
+
+    /// The song that could not play because it is not on this device.
+    @Published var offlineIssue: OfflinePlaybackIssue?
+    /// Held while the player item reads a downloaded file, so the download
+    /// cannot be deleted from under it.
+    private var offlinePlaybackLease: OfflinePlaybackLease?
+    private var offlineScan: Task<Void, Never>?
+    private var offlineScanID = UUID()
+    private var networkState = DownloadNetworkState.unknown
+    private var networkObservation: AnyCancellable?
+    private var offlineActivatedScope: String?
+    /// Set by an automatic advance and consumed by `startPlaying`: a song that
+    /// turns out to be missing offline is skipped rather than reported.
+    private var pendingAutoAdvance = false
+    private var currentWasAdvanced = false
+
+    // MARK: - Queue prefetch (song cache)
+
+    /// Fills the cache with the next few songs while the network is free.
+    private let queuePrefetcher = QueuePrefetcher()
+    private var prefetchObservations: Set<AnyCancellable> = []
+    private var prefetchUpdateScheduled = false
+
+    private enum ResolvedURLLoadResult {
+        case loaded
+        case superseded
+    }
+
+    private init() {
+        engine.actionAtItemEnd = .pause
+        sleepTimer.onDeadlineReached = { [weak self] in
+            self?.pause()
+        }
+        volume = UserDefaults.standard.object(forKey: "player.volume") as? Float ?? 0.8
+        engine.volume = volume
+        repeatMode = UserDefaults.standard.string(forKey: "player.repeat")
+            .flatMap(RepeatMode.init) ?? .off
+
+        #if os(iOS)
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, policy: .longFormAudio, options: [])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            print("Failed to activate audio session: \(error)")
+        }
+
+        // Resume after interruptions (phone calls, WeChat voice messages, …).
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(), queue: .main
+        ) { [weak self] note in
+            MainActor.assumeIsolated {
+                self?.handleAudioInterruption(note)
+            }
+        }
+        // Pause when the output route disappears (headphones unplugged).
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(), queue: .main
+        ) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let self,
+                      let reasonValue = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                      let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue),
+                      reason == .oldDeviceUnavailable, self.isPlaying else { return }
+                self.pause()
+            }
+        }
+        #endif
+
+        timeObserver = engine.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.2, preferredTimescale: 600), queue: .main
+        ) { [weak self] time in
+            MainActor.assumeIsolated {
+                guard let self, !self.isScrubbing else { return }
+                let seconds = time.seconds
+                guard seconds.isFinite else { return }
+
+                // #50: a tick arriving after a long gap while playing is the
+                // retroactive proof the app was frozen (suspended / killed
+                // and relaunched keeps lastPlayerTickAt nil, so the launch
+                // marker covers that case instead). pause() clears the
+                // stamp, so a user pause + resume never logs a bogus gap.
+                let now = Date()
+                if let last = self.lastPlayerTickAt, self.isPlaying,
+                   now.timeIntervalSince(last) > 10 {
+                    DiagnosticLogStore.shared.append(level: .warning, category: "歌词",
+                        message: "播放器 tick 恢复",
+                        detail: "距上次 tick \(Int(now.timeIntervalSince(last))) 秒")
+                }
+                self.lastPlayerTickAt = now
+
+                // Lyrics need this cadence to stay in sync; the cursor itself
+                // only publishes when the line actually changes.
+                self.updateLyricsCursor(at: seconds)
+
+                // The scrubber does not. Publishing the position every tick
+                // re-renders it — and SwiftUI rebuilds the display list for the
+                // whole tree each time — to move the thumb a fraction of a
+                // pixel. Half a second is still smoother than the eye needs.
+                if abs(seconds - self.progress) > 0.45 {
+                    self.progress = seconds
+                    NowPlayingManager.shared.updateElapsed(seconds, rate: self.isPlaying ? 1 : 0)
+                }
+                if self.isPlaying, self.lastPlaybackCheckpoint.duration(to: .now) >= .seconds(20) {
+                    self.persistState()
+                }
+            }
+        }
+
+        statusObservation = engine.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                let wasWaiting = self.isBuffering
+                self.isBuffering = waiting
+                // #50: a stall that never resolves is the black-island path
+                // the log could never see — the item never fails, isPlaying
+                // stays true, the time observer stops (player time frozen),
+                // and the island is left to go stale. Report transitions to
+                // the island manager so it can hold a grace background task
+                // and end the activity cleanly if the stall outlasts it.
+                if waiting, !wasWaiting, self.isPlaying {
+                    LyricsLiveActivityManager.shared.noteAudioStallBegan()
+                } else if !waiting, wasWaiting {
+                    LyricsLiveActivityManager.shared.noteAudioStallEnded()
+                }
+            }
+        }
+
+        NowPlayingManager.shared.attach(to: self, avPlayer: engine)
+        offlineActivatedScope = AccountStore.shared.offlineScope
+        networkObservation = DownloadManager.shared.$network.removeDuplicates().sink { [weak self] network in
+            self?.networkState = network
+        }
+        observePrefetchInputs()
+        // The cache keeps its default limit until something writes to it, and
+        // trims to that on every release; a cache-only session must not lose
+        // songs on the way.
+        if SettingsManager.shared.enableAudioCache {
+            Task { try? await AudioCache.shared.enforce(maximumSizeMB: await SettingsManager.shared.effectiveAudioCacheSizeMB()) }
+        }
+        restoreState()
+    }
+
+    /// Set while the user drags the seek bar so the time observer doesn't fight the thumb.
+    var isScrubbing = false
+
+    #if os(iOS)
+    private var wasPlayingBeforeInterruption = false
+
+    private func handleAudioInterruption(_ note: Notification) {
+        guard let typeValue = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+        switch type {
+        case .began:
+            wasPlayingBeforeInterruption = isPlaying
+            if isPlaying {
+                // The system already silenced us; sync our state and UI.
+                isPlaying = false
+                NowPlayingManager.shared.updateElapsed(progress, rate: 0)
+                persistState()
+            }
+        case .ended:
+            let optionsValue = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+            guard wasPlayingBeforeInterruption, options.contains(.shouldResume) else { return }
+            wasPlayingBeforeInterruption = false
+            try? AVAudioSession.sharedInstance().setActive(true)
+            engine.play()
+            isPlaying = true
+            NowPlayingManager.shared.updateElapsed(progress, rate: 1)
+        @unknown default:
+            break
+        }
+    }
+    #endif
+
+    // MARK: - Entry points
+
+    /// - Parameter context: the place these tracks came from. Supplying it
+    ///   lists that place in the Dock menu's recently played section; callers
+    ///   playing an ad-hoc selection (search results, a single track) omit it.
+    func play(tracks: [Track], source: PlaySource, startAt track: Track? = nil,
+              context: PlayContext? = nil) {
+        guard !tracks.isEmpty else { return }
+        if let context { recordRecent(context) }
+        isFMMode = false
+        queue = tracks
+        self.source = source
+        playNextList.removeAll()
+        let startTrack = track ?? tracks[0]
+        if shuffleEnabled {
+            reshuffle(keeping: startTrack)
+            currentIndex = 0
+        } else {
+            currentIndex = tracks.firstIndex(where: { $0.id == startTrack.id }) ?? 0
+        }
+        startPlaying(activeQueue[currentIndex])
+    }
+
+    func playTrack(_ track: Track) {
+        if let idx = activeQueue.firstIndex(where: { $0.id == track.id }) {
+            currentIndex = idx
+            startPlaying(track)
+        } else {
+            play(tracks: [track], source: .none)
+        }
+    }
+
+    /// Re-resolves the current track at the newly picked quality and resumes
+    /// from the same position — the quality sheet takes effect on the song
+    /// that is playing right now, like the official app, instead of only on
+    /// the next one. Skipped when nothing streams (local copy / stopped /
+    /// already serving that level), where the preference alone is enough.
+    func applyQualityChangeIfPlaying() {
+        guard isPlaying, let track = currentTrack else { return }
+        guard offlinePlaybackLease == nil else { return }
+        // A third-party stream is not quality-switchable (the source picks
+        // its own format), and re-resolving it would just reload for nothing.
+        if thirdPartySource != nil { return }
+        let wanted = SettingsManager.shared.audioQuality.rawValue
+        if let served = servedQuality, served == wanted { return }
+        startPlaying(track, resumeAt: progress)
+    }
+
+    /// Insert a track right after the current one.
+    func addToPlayNext(_ track: Track, playNow: Bool = false) {
+        playNextList.append(track)
+        if playNow || currentTrack == nil {
+            advanceToNext(userInitiated: true)
+        } else {
+            ToastCenter.shared.show(String(localized: "已添加到下一首播放"))
+        }
+    }
+
+    func togglePlayPause() {
+        guard let track = currentTrack else { return }
+        if isPlaying {
+            pause()
+            return
+        } else if engine.currentItem == nil {
+            // Restored session: re-resolve the source.
+            startPlaying(track, resumeAt: progress)
+            return
+        } else {
+            engine.play()
+            isPlaying = true
+            scrobbleStartIfNeeded()
+        }
+        NowPlayingManager.shared.updateElapsed(progress, rate: isPlaying ? 1 : 0)
+    }
+
+    func pause() {
+        engine.pause()
+        isPlaying = false
+        // #50: clear the tick stamp so a later resume does not log a bogus
+        // "tick resumed" gap for a deliberate user pause.
+        lastPlayerTickAt = nil
+        AudioSpectrum.shared.reset()
+        NowPlayingManager.shared.updateElapsed(progress, rate: 0)
+        persistState()
+    }
+
+    func next() {
+        advanceToNext(userInitiated: true)
+    }
+
+    func previous() {
+        if isFMMode { return }
+        if progress > 4 || activeQueue.isEmpty {
+            seek(to: 0)
+            return
+        }
+        var idx = currentIndex - 1
+        if idx < 0 {
+            guard repeatMode == .all else {
+                seek(to: 0)
+                return
+            }
+            idx = activeQueue.count - 1
+        }
+        currentIndex = idx
+        startPlaying(activeQueue[idx])
+    }
+
+    /// Recomputes the current lyric line, publishing only on a change.
+    /// The lead makes a line light up just before it is sung.
+    private func updateLyricsCursor(at seconds: TimeInterval) {
+        let index = lyrics?.activeIndex(at: seconds + 0.2)
+        if index != lyricsCursor.activeIndex {
+            lyricsCursor.activeIndex = index
+        }
+        // Marker-only lines (a bare ♪ for an intro/interlude, "纯音乐",
+        // "间奏", …) are not sung lyrics and must never reach the island:
+        // the current line is the first singable line at or after the
+        // active one, so during an intro the island already shows the
+        // first real line instead of a lone ♪. If only markers remain
+        // (a trailing ♪ outro) it keeps the last sung line; with no
+        // singable line at all the lines stay nil and the island falls
+        // back to the song title. Before the first timed line starts the
+        // same rule applies, so the system Now Playing artist row (which
+        // the island compact view mirrors) never shows a stale ♪ either.
+        let currentIndex: Int?
+        if let index {
+            currentIndex = lyrics?.firstSingableIndex(from: index)
+                ?? lyrics?.lastSingableIndex(through: index - 1)
+        } else {
+            currentIndex = lyrics?.firstSingableIndex(from: 0)
+        }
+        let snapshotLyric = currentIndex.flatMap { lyrics?.lines[$0].text }
+        #if os(iOS)
+        NowPlayingManager.shared.updateCurrentLyric(snapshotLyric)
+        #endif
+        // True Live Activity: only when the line changes (this function is
+        // only called with a new index from the tick/seek paths; the manager
+        // dedupes identical states as a second guard).
+        let previous = currentIndex.flatMap { lyrics?.lastSingableIndex(through: $0 - 1) }.flatMap { lyrics?.lines[$0].text }
+        let current = currentIndex.flatMap { lyrics?.lines[$0].text }
+        let next = currentIndex.flatMap { lyrics?.firstSingableIndex(from: $0 + 1) }.flatMap { lyrics?.lines[$0].text }
+        LyricsLiveActivityManager.shared.lyricDidChange(previous: previous, current: current, next: next)
+    }
+
+    /// Re-publishes the current lyric line to the Live Activity and Now Playing.
+    /// Called by the Settings refresh button and the kumone://lyrics-refresh deep link.
+    func refreshLyricsIsland() {
+        updateLyricsCursor(at: progress)
+        LyricsLiveActivityManager.shared.refreshActivity()
+    }
+
+    func seek(to seconds: TimeInterval, completion: (@MainActor () -> Void)? = nil) {
+        progress = seconds
+        updateLyricsCursor(at: seconds)
+        engine.seek(to: CMTime(seconds: seconds, preferredTimescale: 600),
+                    toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            guard let completion else { return }
+            Task { @MainActor in completion() }
+        }
+        NowPlayingManager.shared.updateElapsed(seconds, rate: isPlaying ? 1 : 0)
+        persistState()
+    }
+
+    func toggleShuffle() {
+        guard !isFMMode else { return }
+        shuffleEnabled.toggle()
+        guard let current = currentTrack else { return }
+        if shuffleEnabled {
+            reshuffle(keeping: current)
+            currentIndex = 0
+        } else {
+            currentIndex = queue.firstIndex(where: { $0.id == current.id }) ?? 0
+        }
+    }
+
+    func cycleRepeatMode() {
+        guard !isFMMode else { return }
+        repeatMode = repeatMode.next
+    }
+
+    /// Single-button mode cycle for the iOS minimal transport row:
+    /// sequential → loop all → loop one → shuffle → sequential.
+    func cyclePlaybackMode() {
+        guard !isFMMode else { return }
+        if shuffleEnabled {
+            toggleShuffle()
+            repeatMode = .off
+        } else {
+            switch repeatMode {
+            case .off:
+                repeatMode = .all
+            case .all:
+                repeatMode = .one
+            case .one:
+                repeatMode = .off
+                toggleShuffle()
+            }
+        }
+    }
+
+    /// Jump to a track in the upcoming list (queue panel click).
+    func jumpTo(_ track: Track) {
+        if let nextIdx = playNextList.firstIndex(where: { $0.id == track.id }) {
+            playNextList.removeSubrange(0...nextIdx)
+            startPlaying(track)
+            return
+        }
+        if let idx = activeQueue.firstIndex(where: { $0.id == track.id }) {
+            currentIndex = idx
+            startPlaying(track)
+        }
+    }
+
+    func removeFromUpcoming(_ track: Track) {
+        if let idx = playNextList.firstIndex(where: { $0.id == track.id }) {
+            playNextList.remove(at: idx)
+            return
+        }
+        if let idx = queue.firstIndex(where: { $0.id == track.id }), idx != currentIndex || shuffleEnabled {
+            queue.remove(at: idx)
+        }
+        if let idx = shuffledQueue.firstIndex(where: { $0.id == track.id }) {
+            shuffledQueue.remove(at: idx)
+        }
+    }
+
+    /// Queue rows carry their occurrence, so a repeated song selects the row
+    /// the listener clicked rather than its first occurrence.
+    func jumpToUpcoming(at index: Int, matching trackID: Int) {
+        guard let selected = upcomingCandidate(at: index, matching: trackID) else { return }
+        switch selected.origin {
+        case .inserted(let offset):
+            playNextList.removeSubrange(0...offset)
+        case .queue(let offset):
+            if !playNextList.isEmpty { playNextList.removeAll() }
+            currentIndex = offset
+        case .fm: return
+        }
+        startPlaying(selected.track)
+    }
+
+    /// Removes the row itself: a repeated song leaves the occurrence the
+    /// listener chose, not its first one, so the current index stays put.
+    func removeUpcoming(at index: Int, matching trackID: Int) {
+        guard let selected = upcomingCandidate(at: index, matching: trackID) else { return }
+        switch selected.origin {
+        case .inserted(let offset): playNextList.remove(at: offset)
+        case .queue(let offset): removeQueueRow(at: offset, trackID: selected.track.id)
+        case .fm: return
+        }
+    }
+
+    /// The row sits after the current index in the active order; the other
+    /// order drops one copy of the same song so both stay the same length.
+    private func removeQueueRow(at offset: Int, trackID: Int) {
+        if shuffleEnabled {
+            shuffledQueue.remove(at: offset)
+            if let idx = queue.firstIndex(where: { $0.id == trackID }) { queue.remove(at: idx) }
+        } else {
+            queue.remove(at: offset)
+            if let idx = shuffledQueue.firstIndex(where: { $0.id == trackID }) { shuffledQueue.remove(at: idx) }
+        }
+    }
+
+    /// The row at `index` of `upcomingTracks`, if it still shows `trackID`.
+    private func upcomingCandidate(at index: Int, matching trackID: Int) -> PlaybackQueueCandidate? {
+        let candidates = PlaybackQueuePlan.next(queue: activeQueue, currentIndex: currentIndex, inserted: playNextList,
+                                                fm: [], isFM: false, repeatAll: false, limit: max(0, index + 1))
+        guard candidates.indices.contains(index), candidates[index].track.id == trackID else { return nil }
+        return candidates[index]
+    }
+
+    // MARK: - Personal FM
+
+    func startFM() {
+        guard !isFMMode || !isPlaying else { return }
+        recordRecent(.fm)
+        isFMMode = true
+        shuffleEnabled = false
+        repeatMode = .off
+        queue = []
+        shuffledQueue = []
+        playNextList = []
+        currentIndex = -1
+        source = .none
+        Task { await fmAdvance() }
+    }
+
+    func fmNext() {
+        guard isFMMode else { return }
+        Task { await fmAdvance() }
+    }
+
+    func fmTrash() {
+        guard isFMMode, let track = currentTrack else { return }
+        Task {
+            await fmAdvance()
+            try? await MusicAPI.fmTrash(id: track.id)
+        }
+    }
+
+    private func fmAdvance() async {
+        if usesOfflineQueue {
+            advanceOffline()
+            return
+        }
+        if fmUpcoming.isEmpty {
+            for attempt in 0..<3 {
+                if let tracks = try? await MusicAPI.personalFM(), !tracks.isEmpty {
+                    fmUpcoming = tracks
+                    break
+                }
+                if attempt == 2 {
+                    ToastCenter.shared.show(String(localized: "获取私人漫游数据失败"))
+                    return
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+        guard !fmUpcoming.isEmpty else { return }
+        let track = fmUpcoming.removeFirst()
+        pendingAutoAdvance = true
+        startPlaying(track)
+        if fmUpcoming.count < 1 {
+            if let more = try? await MusicAPI.personalFM() {
+                fmUpcoming.append(contentsOf: more)
+            }
+        }
+    }
+
+    // MARK: - Advancing
+
+    private func advanceToNext(userInitiated: Bool) {
+        if usesOfflineQueue, !nextCandidates().isEmpty {
+            pendingAutoAdvance = !userInitiated
+            advanceOffline()
+            return
+        }
+        if isFMMode {
+            Task { await fmAdvance() }
+            return
+        }
+        if !playNextList.isEmpty {
+            let track = playNextList.removeFirst()
+            pendingAutoAdvance = !userInitiated
+            startPlaying(track)
+            return
+        }
+        guard !activeQueue.isEmpty else { return }
+        var idx = currentIndex + 1
+        if idx >= activeQueue.count {
+            guard repeatMode == .all else {
+                if userInitiated {
+                    ToastCenter.shared.show(String(localized: "已经是最后一首了"))
+                } else {
+                    isPlaying = false
+                    NowPlayingManager.shared.updateElapsed(progress, rate: 0)
+                }
+                return
+            }
+            idx = 0
+        }
+        currentIndex = idx
+        pendingAutoAdvance = !userInitiated
+        startPlaying(activeQueue[idx])
+    }
+
+    private func handleItemEnded() {
+        scrobbleIfNeeded(completed: true)
+
+        if sleepTimer.consumeEndOfCurrentTrack() {
+            progress = duration
+            updateLyricsCursor(at: duration)
+            pause()
+            engine.replaceCurrentItem(with: nil)
+            releaseCurrentPlaybackResources()
+            return
+        }
+
+        guard isPlaying else { return }
+
+        if repeatMode == .one, !isFMMode {
+            scrobbled = false
+            seek(to: 0)
+            engine.play()
+            isPlaying = true
+            return
+        }
+        advanceToNext(userInitiated: false)
+    }
+
+    // MARK: - Source resolution
+
+    private func startPlaying(_ track: Track,
+                              localLease: OfflinePlaybackLease? = nil, resumeAt: TimeInterval = 0) {
+        offlineScan?.cancel()
+        offlineScan = nil
+        offlineScanID = UUID()
+        offlineIssue = nil
+        currentWasAdvanced = pendingAutoAdvance
+        pendingAutoAdvance = false
+        pendingAudioResourceLoader?.cancel()
+        pendingAudioResourceLoader = nil
+        scrobbleIfNeeded(completed: false)
+        currentTrack = track
+        playbackAccountID = AccountStore.shared.profile?.userId
+        progress = resumeAt
+        duration = track.duration
+        servedQuality = nil
+        thirdPartySource = nil
+        currentThirdPartyPlatform = nil
+        lastThirdPartyURL = nil
+        failedThirdPartyURLs = []
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        isTrial = false
+        lyrics = nil
+        lyricsRetryTask?.cancel()
+        lyricsRetryTask = nil
+        lyricsRetryCount = 0
+        scrobbled = false
+        startScrobbled = false
+        isPlaying = true
+        // One-time nudge: the island toggle defaults off and nothing in the
+        // player mentions it, so a user who never opens Settings > 歌词
+        // never learns it exists. Point at it once per install; never
+        // auto-enable.
+        if !SettingsManager.shared.lyricsOnIsland, !SettingsManager.shared.lyricsIslandNudgeShown {
+            SettingsManager.shared.lyricsIslandNudgeShown = true
+            ToastCenter.shared.show(String(localized: "想在灵动岛看歌词？去「设置 > 歌词」打开「歌词上岛」"))
+        }
+        lyricsCursor.activeIndex = nil
+        // Before the URL is even resolved: holds the bars still rather than
+        // letting them fall back to the decorative animation for the moment it
+        // takes to find out whether this source can be tapped.
+        AudioSpectrum.shared.beginPreparing()
+        resolveGeneration += 1
+        let generation = resolveGeneration
+        if advancingAfterFailure {
+            advancingAfterFailure = false
+        } else {
+            consecutiveFailures = 0
+        }
+
+        NowPlayingManager.shared.updateMetadata(for: track, duration: track.duration)
+        persistState()
+
+        Task {
+            await resolveAndLoad(track, generation: generation, localLease: localLease, resumeAt: resumeAt)
+        }
+        Task {
+            await loadLyrics(for: track, generation: generation)
+        }
+    }
+
+    /// - Parameter skipsLocalCopies: set when the downloaded or cached copy
+    ///   just failed to play, so the reload fetches the song again instead
+    ///   of the same file.
+    private func resolveAndLoad(_ track: Track, generation: Int,
+                                localLease: OfflinePlaybackLease? = nil,
+                                skipsLocalCopies: Bool = false,
+                                resumeAt: TimeInterval = 0) async {
+        let mode = SettingsManager.shared.playbackSourceMode
+        let wanted = SettingsManager.shared.audioQuality
+        let quality = wanted.neteaseLevel
+        let allowsThirdParty = mode != .official
+        let cacheEnabled = SettingsManager.shared.enableAudioCache && !skipsLocalCopies
+
+        // A downloaded copy beats the network, and is all there is without one.
+        if !skipsLocalCopies, let lease = await acquireOfflineLease(for: track, generation: generation, reusing: localLease) {
+            await playOfflineFile(lease, for: track, generation: generation, resumeAt: resumeAt)
+            return
+        }
+        guard generation == resolveGeneration else { return }
+
+        if cacheEnabled {
+            do {
+                if let cached = try await AudioCache.shared.entry(
+                    for: track.id,
+                    requestedQuality: quality,
+                    allowsThirdParty: allowsThirdParty
+                ) {
+                    guard generation == resolveGeneration else { return }
+                    let lease = await AudioCache.shared.retain(cached)
+                    guard generation == resolveGeneration else {
+                        releaseAudioCacheLease(lease)
+                        return
+                    }
+                    // Cache entries written before the AudioQuality swap store a
+                    // NetEase level ("jymaster"); normalize to a kun rawValue so
+                    // the quality comparison in applyQualityChangeIfPlaying holds.
+                    servedQuality = cached.metadata.servedQuality.flatMap { AudioQuality(neteaseLevel: $0)?.rawValue } ?? cached.metadata.servedQuality
+                    if case .thirdParty(let source) = cached.metadata.source {
+                        thirdPartySource = source
+                    }
+                    _ = await installResolvedAsset(
+                        AVURLAsset(url: cached.fileURL),
+                        for: track,
+                        generation: generation,
+                        durationMS: nil,
+                        cacheLease: lease,
+                        resumeAt: resumeAt
+                    )
+                    return
+                }
+            } catch {
+                print("Audio cache lookup failed: \(error)")
+            }
+        }
+
+        // Without a network, the cache is the last place to look.
+        if usesOfflineQueue {
+            if cacheEnabled, await loadFallbackCache(for: track, generation: generation, allowsThirdParty: allowsThirdParty, resumeAt: resumeAt) { return }
+            guard generation == resolveGeneration else { return }
+            unavailableOffline(track, generation: generation)
+            return
+        }
+
+        var data: SongURLData?
+        // thirdParty mode never calls the official endpoint.
+        if mode != .thirdParty {
+            do {
+                data = try await MusicAPI.songURL(ids: [track.id], level: quality).first
+                if data?.url == nil, quality != AudioQuality.standard.neteaseLevel {
+                    data = try await MusicAPI.songURL(ids: [track.id], level: AudioQuality.standard.neteaseLevel).first
+                }
+            } catch {
+            guard generation == resolveGeneration else { return }
+            // A download covers a request that died on the network. Anything
+            // else keeps upstream's path: third-party sources, then the cache.
+            if ConnectivityFailure.matches(error) {
+                if let lease = await acquireOfflineLease(for: track, generation: generation, anyQuality: true) {
+                    await playOfflineFile(lease, for: track, generation: generation, resumeAt: resumeAt)
+                    return
+                }
+                guard generation == resolveGeneration else { return }
+                if usesOfflineQueue {
+                    if cacheEnabled, await loadFallbackCache(for: track, generation: generation, allowsThirdParty: allowsThirdParty, resumeAt: resumeAt) { return }
+                    guard generation == resolveGeneration else { return }
+                    unavailableOffline(track, generation: generation)
+                    return
+                }
+            }
+            }
+        }
+        guard generation == resolveGeneration else { return }
+
+        var resolvedURL: URL?
+        if let urlString = data?.url {
+            resolvedURL = URL(string: urlString.replacingOccurrences(of: "http://", with: "https://"))
+        }
+
+        // The official route cannot play this song in full (no URL, or a
+        // trial clip only): fall back to the user's LX custom sources
+        // before giving up. This applies in every mode — including
+        // .official — because a VIP song the account cannot play is exactly
+        // the case the fallback exists for. It never fakes membership: LX
+        // resolves only from sources the user imported themselves.
+        var thirdPartyAttempted = false
+        if resolvedURL == nil || data?.freeTrialInfo != nil {
+            thirdPartyAttempted = true
+            if await resolveAndLoadThirdParty(track, generation: generation, resumeAt: resumeAt, allowOfficialMode: true) { return }
+        }
+        guard generation == resolveGeneration else { return }
+
+        guard let url = resolvedURL else {
+            if cacheEnabled, await loadFallbackCache(
+                for: track,
+                generation: generation,
+                allowsThirdParty: allowsThirdParty,
+                resumeAt: resumeAt
+            ) {
+                return
+            }
+            handleUnplayable(track)
+            return
+        }
+
+        servedQuality = data?.level.flatMap { AudioQuality(neteaseLevel: $0)?.rawValue } ?? data?.level
+        if data?.freeTrialInfo != nil {
+            isTrial = true
+            // Say WHY only a trial clip plays, instead of a generic banner:
+            // the fix (importing a working source) is then obvious.
+            if thirdPartyAttempted {
+                // resolveAndLoadThirdParty already toasted the per-source
+                // failure reason.
+            } else if mode == .official {
+                ToastCenter.shared.show(String(localized: "VIP 试听片段（当前为官方音源模式，未使用第三方音源）"))
+            } else {
+                ToastCenter.shared.show(String(localized: "VIP 试听片段（第三方音源暂不可用）"))
+            }
+        }
+        _ = await loadResolvedURL(track, url: url, durationMS: data?.time, generation: generation, resumeAt: resumeAt)
+    }
+
+    private func resolveAndLoadThirdParty(
+        _ track: Track,
+        generation: Int,
+        requiresActivePlayback: Bool = false,
+        resumeAt: TimeInterval = 0,
+        excludingURLs: Set<String> = [],
+        allowOfficialMode: Bool = false
+    ) async -> Bool {
+        // The mode gate is skipped for the official-fallback path: when the
+        // official route cannot play a song in full, LX is the fallback in
+        // every mode (see resolveAndLoad). Direct LX retries keep the gate.
+        guard allowOfficialMode || SettingsManager.shared.playbackSourceMode != .official else { return false }
+        guard generation == resolveGeneration,
+              !requiresActivePlayback || isPlaying
+        else { return false }
+
+        let resolved: LXUserAPIService.ResolvedURL
+        do {
+            resolved = try await LXUserAPIService.shared.resolveMusicURL(
+                for: track, quality: SettingsManager.shared.audioQuality.lxType, excludingURLs: excludingURLs, forceThirdParty: true)
+        } catch {
+            lastThirdPartyFailure = error.localizedDescription
+            ToastCenter.shared.show(String(localized: "第三方音源解析失败：\(error.localizedDescription)"))
+            return false
+        }
+        guard generation == resolveGeneration,
+              !requiresActivePlayback || isPlaying
+        else { return false }
+
+        lastThirdPartyFailure = nil
+        lastThirdPartyURL = resolved.url
+        currentThirdPartyPlatform = resolved.platform
+        thirdPartySource = resolved.platform ?? "LX"
+        servedQuality = normalizedLevel(resolved.quality)
+        isTrial = false
+
+        // LX ResolvedURL has no headers; loadResolvedURL takes the default nil.
+        let loadResult = await loadResolvedURL(
+            track,
+            url: resolved.url,
+            durationMS: nil,
+            generation: generation,
+            resumeAt: resumeAt
+        )
+        guard case .loaded = loadResult else { return false }
+
+        ToastCenter.shared.show(String(localized: "已使用第三方音源：\(thirdPartySource ?? "LX")"))
+        return true
+    }
+
+    private func handleUnplayable(_ track: Track) {
+        consecutiveFailures += 1
+        let reason = track.playability(privilege: nil,
+                                       isLoggedIn: AccountStore.shared.isLoggedIn,
+                                       vipType: AccountStore.shared.vipType).reason
+        let thirdPartyDetail = lastThirdPartyFailure.map { String(localized: "（第三方音源：\($0)）") } ?? ""
+        ToastCenter.shared.show(String(localized: "《\(track.name)》无法播放\(reason.map { "：\($0)" } ?? "")\(thirdPartyDetail)"))
+        guard isPlaying else {
+            engine.replaceCurrentItem(with: nil)
+            releaseCurrentPlaybackResources()
+            return
+        }
+        if consecutiveFailures < 5 {
+            advancingAfterFailure = true
+            advanceToNext(userInitiated: false)
+        } else {
+            isPlaying = false
+        }
+    }
+
+    private func loadResolvedURL(
+        _ track: Track,
+        url: URL,
+        durationMS: Int?,
+        generation: Int,
+        resumeAt: TimeInterval = 0,
+        headers: [String: String]? = nil
+    ) async -> ResolvedURLLoadResult {
+        // Skip a CDN host that just failed to connect (see CDNHost).
+        let remote = CDNHost.preferred(for: url)
+
+        var asset = AVURLAsset(url: remote)
+        var resourceLoader: CachingAudioResourceLoader?
+        // A custom-source stream (网盘 links) is proxied through the resource
+        // loader even with the song cache off: the loader is what attaches
+        // the headers the file host insists on — AVPlayer alone gets 403.
+        // With caching off the limit is 0, which makes the loader stream
+        // through without writing anything.
+        let wantsCaching = SettingsManager.shared.enableAudioCache && !isTrial
+        let needsHeaderProxy = !(headers ?? [:]).isEmpty
+        if wantsCaching || needsHeaderProxy {
+            let cacheLimitMB = wantsCaching
+                ? await SettingsManager.shared.effectiveAudioCacheSizeMB()
+                : 0
+            guard generation == resolveGeneration else { return .superseded }
+            let source: AudioCacheSource = thirdPartySource.map(AudioCacheSource.thirdParty) ?? .origin
+            do {
+                let loader = try CachingAudioResourceLoader(
+                    remoteURL: remote,
+                    trackID: track.id,
+                    requestedQuality: SettingsManager.shared.audioQuality.neteaseLevel,
+                    servedQuality: servedQuality,
+                    source: source,
+                    maximumCacheSizeMB: cacheLimitMB,
+                    headers: headers ?? [:]
+                )
+                guard generation == resolveGeneration else {
+                    loader.cancel()
+                    return .superseded
+                }
+                let cachedAsset = AVURLAsset(url: loader.assetURL)
+                loader.attach(to: cachedAsset)
+                pendingAudioResourceLoader = loader
+                resourceLoader = loader
+                asset = cachedAsset
+            } catch {
+                print("Audio source will play without caching: \(error)")
+            }
+        }
+
+        return await installResolvedAsset(
+            asset,
+            for: track,
+            generation: generation,
+            durationMS: durationMS,
+            remoteURL: remote,
+            resourceLoader: resourceLoader,
+            resumeAt: resumeAt
+        )
+    }
+
+    private func loadFallbackCache(
+        for track: Track,
+        generation: Int,
+        allowsThirdParty: Bool,
+        resumeAt: TimeInterval = 0
+    ) async -> Bool {
+        do {
+            guard let cached = try await AudioCache.shared.fallbackEntry(
+                for: track.id,
+                allowsThirdParty: allowsThirdParty
+            ) else { return false }
+            guard generation == resolveGeneration else { return true }
+            let lease = await AudioCache.shared.retain(cached)
+            guard generation == resolveGeneration else {
+                releaseAudioCacheLease(lease)
+                return true
+            }
+            servedQuality = cached.metadata.servedQuality.flatMap { AudioQuality(neteaseLevel: $0)?.rawValue } ?? cached.metadata.servedQuality
+            if case .thirdParty(let source) = cached.metadata.source {
+                thirdPartySource = source
+            }
+            _ = await installResolvedAsset(
+                AVURLAsset(url: cached.fileURL),
+                for: track,
+                generation: generation,
+                durationMS: nil,
+                cacheLease: lease,
+                resumeAt: resumeAt
+            )
+            return true
+        } catch {
+            print("Audio cache fallback lookup failed: \(error)")
+            return false
+        }
+    }
+
+    private func installResolvedAsset(
+        _ asset: AVURLAsset,
+        for track: Track,
+        generation: Int,
+        durationMS: Int?,
+        remoteURL: URL? = nil,
+        resourceLoader: CachingAudioResourceLoader? = nil,
+        cacheLease: UUID? = nil,
+        offlineLease: OfflinePlaybackLease? = nil,
+        resumeAt: TimeInterval = 0
+    ) async -> ResolvedURLLoadResult {
+        // Resolve the audio track before the item goes live: an audio mix attached
+        // after playback starts is silently ignored. The one tap now drives both
+        // the spectrum and iOS equalizer, so local/cache/offline assets take the
+        // same path as remote streams. Unsupported sources still play untouched.
+        let assetTrack = await loadAudioTrack(from: asset, timeout: 2)
+        guard generation == resolveGeneration,
+              resourceLoader.map({ pendingAudioResourceLoader === $0 }) ?? true else {
+            resourceLoader?.cancel()
+            if let cacheLease {
+                releaseAudioCacheLease(cacheLease)
+            }
+            if let offlineLease { Task { try? await OfflineStore.shared.release(offlineLease) } }
+            return .superseded
+        }
+
+        let item = AVPlayerItem(asset: asset)
+        if let assetTrack,
+           let mix = AudioSpectrum.shared.makeAudioMix(for: assetTrack) {
+            item.audioMix = mix
+        } else {
+            AudioSpectrum.shared.markUntappable()
+        }
+
+        itemStatusObservation?.invalidate()
+        let sourceID = currentThirdPartyPlatform
+        itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            switch item.status {
+            case .readyToPlay:
+                Task { @MainActor in
+                    self?.itemBecameReady(generation: generation)
+                }
+            case .failed:
+                let error = item.error
+                Task { @MainActor in
+                    if let sourceID {
+                        self?.handleThirdPartyItemFailure(track: track, generation: generation, platform: sourceID)
+                    } else {
+                        self?.handleItemFailure(
+                            track: track,
+                            generation: generation,
+                            remoteURL: remoteURL,
+                            durationMS: durationMS,
+                            error: error
+                        )
+                    }
+                }
+            default:
+                break
+            }
+        }
+
+        if let old = endObserver {
+            NotificationCenter.default.removeObserver(old)
+        }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.didPlayToEndTimeNotification, object: item, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleItemEnded()
+            }
+        }
+        let previousResourceLoader = audioResourceLoader
+        let previousCacheLease = audioCacheLease
+        let previousOfflineLease = offlinePlaybackLease
+        if resourceLoader != nil {
+            pendingAudioResourceLoader = nil
+        }
+        audioResourceLoader = resourceLoader
+        audioCacheLease = cacheLease
+        offlinePlaybackLease = offlineLease
+        engine.replaceCurrentItem(with: item)
+        previousResourceLoader?.cancel()
+        if let previousCacheLease {
+            releaseAudioCacheLease(previousCacheLease)
+        }
+        if let previousOfflineLease { Task { try? await OfflineStore.shared.release(previousOfflineLease) } }
+        if resumeAt > 0 {
+            // The item's own length when known; the published duration may
+            // still belong to the previous song or be unknown.
+            let length = durationMS.map { TimeInterval($0) / 1000 } ?? duration
+            let time = CMTime(seconds: length > 0.1 ? min(resumeAt, length - 0.1) : resumeAt, preferredTimescale: 600)
+            _ = await engine.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            guard generation == resolveGeneration else { return .superseded }
+        }
+        if isPlaying {
+            engine.play()
+            scrobbleStartIfNeeded()
+        }
+
+        if let durationMS, durationMS > 0 {
+            duration = TimeInterval(durationMS) / 1000
+            NowPlayingManager.shared.updateMetadata(for: track, duration: duration)
+        }
+        return .loaded
+    }
+
+    private func handleThirdPartyItemFailure(
+        track: Track,
+        generation: Int,
+        platform: String?
+    ) {
+        guard generation == resolveGeneration,
+              currentTrack?.id == track.id,
+              currentThirdPartyPlatform == platform
+        else { return }
+
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        currentThirdPartyPlatform = nil
+        thirdPartySource = nil
+        engine.replaceCurrentItem(with: nil)
+        releaseCurrentPlaybackResources()
+        AudioSpectrum.shared.beginPreparing()
+
+        guard isPlaying else {
+            return
+        }
+
+        Task {
+            // The URL that just failed goes on the exclusion list, so the
+            // retry resolves a different candidate instead of the same dead
+            // URL again. The set accumulates per track (reset in
+            // startPlaying), so a persistently bad source terminates in
+            // handleUnplayable instead of looping.
+            if let failedURL = lastThirdPartyURL {
+                failedThirdPartyURLs.insert(failedURL.absoluteString)
+            }
+            let loaded = await resolveAndLoadThirdParty(
+                track,
+                generation: generation,
+                requiresActivePlayback: true,
+                excludingURLs: failedThirdPartyURLs
+            )
+            guard isPlaying else { return }
+            guard loaded else {
+                guard generation == resolveGeneration else { return }
+                handleUnplayable(track)
+                return
+            }
+        }
+    }
+
+    /// The song is playing for real: the failure streak is over.
+    private func itemBecameReady(generation: Int) {
+        guard generation == resolveGeneration else { return }
+        consecutiveFailures = 0
+    }
+
+    /// An upstream stream or a cached file failed. The song gets one reload,
+    /// resuming where it stopped: on the CDN twin when the host could not be
+    /// reached (the caching loader already swaps hosts itself, so this covers
+    /// streams that bypass it), otherwise from a freshly resolved URL, since a
+    /// signature may have expired, the network changed, or the local file
+    /// was bad. With no network at all, or when the reload fails for lack of
+    /// one, a downloaded copy takes over; any other second failure goes to the
+    /// third-party sources, then skips.
+    private func handleItemFailure(
+        track: Track,
+        generation: Int,
+        remoteURL: URL?,
+        durationMS: Int?,
+        error: Error?
+    ) {
+        guard generation == resolveGeneration,
+              currentTrack?.id == track.id,
+              currentThirdPartyPlatform == nil
+        else { return }
+
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        engine.replaceCurrentItem(with: nil)
+        releaseCurrentPlaybackResources()
+        let connectivity = error.map(ConnectivityFailure.matches) ?? false
+
+        guard itemRetryGeneration != generation else {
+            if connectivity {
+                handleConnectivityItemFailure(track: track, generation: generation)
+                return
+            }
+            Task {
+                guard SettingsManager.shared.canResolveUnblockedTracks,
+                      await resolveAndLoadThirdParty(track, generation: generation, allowOfficialMode: true) else {
+                    guard generation == resolveGeneration else { return }
+                    handleUnplayable(track)
+                    return
+                }
+            }
+            return
+        }
+        itemRetryGeneration = generation
+        let twin = remoteURL.flatMap { url in
+            error.flatMap { CDNHost.failover(from: url, after: $0) }
+        }
+        // No network at all: the downloaded copy is the only way on.
+        if twin == nil, connectivity, usesOfflineQueue {
+            handleConnectivityItemFailure(track: track, generation: generation)
+            return
+        }
+        AudioSpectrum.shared.beginPreparing()
+        let resumeAt = progress > 1 ? progress : 0
+        Task {
+            if let twin {
+                _ = await loadResolvedURL(track, url: twin, durationMS: durationMS, generation: generation, resumeAt: resumeAt)
+            } else {
+                await resolveAndLoad(track, generation: generation, skipsLocalCopies: remoteURL == nil, resumeAt: resumeAt)
+            }
+        }
+    }
+
+    private func releaseAudioCacheLease(_ leaseID: UUID) {
+        Task {
+            do {
+                try await AudioCache.shared.release(leaseID)
+            } catch {
+                print("Audio cache could not release its playback lease: \(error)")
+            }
+        }
+    }
+
+    private func releaseCurrentPlaybackResources() {
+        let resourceLoader = audioResourceLoader
+        let cacheLease = audioCacheLease
+        audioResourceLoader = nil
+        audioCacheLease = nil
+        resourceLoader?.cancel()
+        if let cacheLease {
+            releaseAudioCacheLease(cacheLease)
+        }
+        releaseOfflineLease()
+    }
+
+    /// Resolves the asset's audio track, giving up after `timeout` so a slow or
+    /// uncooperative source delays playback no longer than it would today.
+    private func loadAudioTrack(from asset: AVURLAsset, timeout: TimeInterval) async -> AVAssetTrack? {
+        await withTaskGroup(of: AVAssetTrack?.self) { group in
+            group.addTask {
+                try? await asset.loadTracks(withMediaType: .audio).first
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private func loadLyrics(for track: Track, generation: Int) async {
+        guard generation == resolveGeneration else { return }
+        let outcome = await FlutifyLyricsService.shared.resolveDetailed(track: track)
+        guard generation == resolveGeneration else { return }
+        guard let resolved = outcome.lyrics else {
+            // Nothing to show: log why (this is the trail a later
+            // exported diagnostic log is read from), and retry only a
+            // network failure while the same song is still playing.
+            logLyricsOutcome(outcome, track: track)
+            scheduleLyricsRetryIfNeeded(for: track, generation: generation, outcome: outcome)
+            return
+        }
+        lyricsRetryCount = 0
+        logLyricsOutcome(outcome, track: track)
+        lyrics = resolved.parsed
+        updateLyricsCursor(at: progress)
+    }
+
+    /// One diagnostic-log line per resolve, so an exported log shows which
+    /// source hit, or why there are no lyrics — the #47 log had 166
+    /// 音源请求 entries and zero lyric entries, so a missing island was
+    /// undiagnosable. Category is "歌词", not "灵动岛":
+    /// lastIslandFailure takes the newest "灵动岛" entry as the failure
+    /// line, and these info entries must not masquerade as failures.
+    private func logLyricsOutcome(_ outcome: FlutifyLyricsService.ResolveOutcome, track: Track) {
+        let detail = "\(track.name) - \(track.artistNames)"
+        if let lyrics = outcome.lyrics {
+            DiagnosticLogStore.shared.append(level: .info, category: "歌词",
+                message: "歌词已取到（\(outcome.source ?? "未知源")）",
+                detail: "\(detail)，\(lyrics.parsed.lines.count) 行")
+        } else if outcome.networkError {
+            DiagnosticLogStore.shared.append(level: .warning, category: "歌词",
+                message: "取词失败：网络错误，将重试",
+                detail: detail)
+        } else if outcome.negativeCached {
+            DiagnosticLogStore.shared.append(level: .info, category: "歌词",
+                message: "无歌词：之前已确认三源均无词",
+                detail: detail)
+        } else {
+            DiagnosticLogStore.shared.append(level: .info, category: "歌词",
+                message: "无歌词：三源均无此歌词",
+                detail: detail)
+        }
+    }
+
+    /// Retries a network-error resolve after 10s, at most 3 times per
+    /// track, and only while the same song is still playing. A definitive
+    /// "no lyrics anywhere" (fresh or cached negative) is never retried:
+    /// asking again cannot change the answer.
+    private func scheduleLyricsRetryIfNeeded(for track: Track, generation: Int, outcome: FlutifyLyricsService.ResolveOutcome) {
+        guard outcome.networkError, track.id == currentTrack?.id else { return }
+        guard lyricsRetryCount < Self.lyricsRetryMaxAttempts else {
+            DiagnosticLogStore.shared.append(level: .warning, category: "歌词",
+                message: "取词重试已达上限（\(Self.lyricsRetryMaxAttempts) 次），不再重试",
+                detail: "\(track.name) - \(track.artistNames)")
+            return
+        }
+        lyricsRetryCount += 1
+        lyricsRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.lyricsRetryDelay * 1_000_000_000))
+            guard let self else { return }
+            guard generation == self.resolveGeneration,
+                  self.currentTrack?.id == track.id,
+                  self.isPlaying else { return }
+            await self.loadLyrics(for: track, generation: generation)
+        }
+    }
+
+    // MARK: - Offline playback
+
+    /// Downloads belong to one account; see `activateAccount`.
+    private var offlineAccountScope: String? { AccountStore.shared.offlineScope }
+    private var usesOfflineQueue: Bool { networkState.isKnown && !networkState.connected }
+
+    private func nextCandidates() -> [PlaybackQueueCandidate] {
+        PlaybackQueuePlan.next(queue: activeQueue, currentIndex: currentIndex, inserted: playNextList,
+                               fm: fmUpcoming, isFM: isFMMode, repeatAll: repeatMode == .all)
+    }
+
+    /// Everything the prefetch window depends on. `@Published` fires before
+    /// the value lands, so the update itself waits for the next turn.
+    private func observePrefetchInputs() {
+        let player: [AnyPublisher<Void, Never>] = [
+            $queue.map { _ in }.eraseToAnyPublisher(), $shuffledQueue.map { _ in }.eraseToAnyPublisher(),
+            $shuffleEnabled.map { _ in }.eraseToAnyPublisher(), $playNextList.map { _ in }.eraseToAnyPublisher(),
+            $currentIndex.map { _ in }.eraseToAnyPublisher(), $currentTrack.map { _ in }.eraseToAnyPublisher(),
+            $fmUpcoming.map { _ in }.eraseToAnyPublisher(), $isFMMode.map { _ in }.eraseToAnyPublisher(),
+            $repeatMode.map { _ in }.eraseToAnyPublisher(), $isPlaying.map { _ in }.eraseToAnyPublisher(),
+            $isBuffering.map { _ in }.eraseToAnyPublisher(),
+        ]
+        let environment: [AnyPublisher<Void, Never>] = [
+            DownloadManager.shared.$network.map { _ in }.eraseToAnyPublisher(),
+            DownloadManager.shared.$jobs.map { _ in }.eraseToAnyPublisher(),
+            SettingsManager.shared.$enableAudioCache.map { _ in }.eraseToAnyPublisher(),
+            SettingsManager.shared.$audioQuality.map { _ in }.eraseToAnyPublisher(),
+            NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange).map { _ in }.eraseToAnyPublisher(),
+        ]
+        Publishers.MergeMany(player + environment)
+            .sink { [weak self] _ in self?.scheduleUpdatePrefetch() }
+            .store(in: &prefetchObservations)
+    }
+
+    private func scheduleUpdatePrefetch() {
+        guard !prefetchUpdateScheduled else { return }
+        prefetchUpdateScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.prefetchUpdateScheduled = false
+            self.updatePrefetch()
+        }
+    }
+
+    private func updatePrefetch() {
+        guard isPlaying, !isBuffering, SettingsManager.shared.enableAudioCache, let current = currentTrack,
+              QueuePrefetcher.permits(network: networkState, lowPower: ProcessInfo.processInfo.isLowPowerModeEnabled)
+        else { queuePrefetcher.update(nil); return }
+        let upcoming = PrefetchLimits().window(nextCandidates().map(\.track))
+        guard !upcoming.isEmpty else { queuePrefetcher.update(nil); return }
+        let scope = offlineAccountScope
+        let pending = Set(DownloadManager.shared.pendingJobs.filter { $0.accountScope == scope }.map(\.track.id))
+        queuePrefetcher.update(.init(scope: scope, currentTrackID: current.id, tracks: upcoming,
+                                     quality: SettingsManager.shared.audioQuality.neteaseLevel,
+                                     allowsThirdParty: SettingsManager.shared.canResolveUnblockedTracks,
+                                     pendingDownloadTrackIDs: pending))
+    }
+
+    /// A downloaded copy of the track. Online it must match the chosen quality
+    /// or better; offline, any quality will do.
+    private func acquireOfflineLease(for track: Track, generation: Int, reusing lease: OfflinePlaybackLease? = nil,
+                                     anyQuality: Bool = false) async -> OfflinePlaybackLease? {
+        let scope = offlineAccountScope
+        var lease = lease
+        if lease == nil, let scope {
+            lease = try? await OfflineStore.shared.acquire(accountScope: scope, trackID: track.id,
+                preferredQuality: SettingsManager.shared.audioQuality.neteaseLevel,
+                allowLowerQuality: anyQuality || !networkState.connected)
+        }
+        guard let lease else { return nil }
+        guard generation == resolveGeneration, scope == offlineAccountScope,
+              lease.descriptor.identity.accountScope == scope else {
+            try? await OfflineStore.shared.release(lease)
+            return nil
+        }
+        return lease
+    }
+
+    private func playOfflineFile(_ lease: OfflinePlaybackLease, for track: Track, generation: Int,
+                                 resumeAt: TimeInterval = 0) async {
+        servedQuality = lease.descriptor.identity.quality
+        _ = await installResolvedAsset(AVURLAsset(url: lease.url), for: track, generation: generation,
+                                       durationMS: Int(lease.descriptor.duration * 1000),
+                                       offlineLease: lease, resumeAt: resumeAt)
+    }
+
+    /// The stream died for lack of network. A download of the same song picks
+    /// up where it stopped; otherwise the song is reported or skipped.
+    private func handleConnectivityItemFailure(track: Track, generation: Int) {
+        guard generation == resolveGeneration, currentTrack?.id == track.id else { return }
+        let position = max(progress, livePlaybackTime)
+        resolveGeneration += 1
+        let recovery = resolveGeneration
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        engine.replaceCurrentItem(with: nil)
+        releaseCurrentPlaybackResources()
+        Task {
+            if let lease = await acquireOfflineLease(for: track, generation: recovery, anyQuality: true) {
+                await playOfflineFile(lease, for: track, generation: recovery, resumeAt: position)
+                return
+            }
+            guard recovery == resolveGeneration else { return }
+            unavailableOffline(track, generation: recovery, autoAdvance: currentWasAdvanced && position < 0.5)
+        }
+    }
+
+    private func releaseOfflineLease() {
+        guard let lease = offlinePlaybackLease else { return }
+        offlinePlaybackLease = nil
+        Task { try? await OfflineStore.shared.release(lease) }
+    }
+
+    private func unavailableOffline(_ track: Track, generation: Int, autoAdvance: Bool? = nil) {
+        guard generation == resolveGeneration else { return }
+        if autoAdvance ?? currentWasAdvanced {
+            advanceOffline(initialSkipped: 1, excludingFailedCurrent: true)
+            return
+        }
+        engine.replaceCurrentItem(with: nil)
+        releaseCurrentPlaybackResources()
+        isPlaying = false
+        isBuffering = false
+        offlineIssue = .init(kind: .missingTrack, trackName: track.name)
+        NowPlayingManager.shared.updateElapsed(progress, rate: 0)
+    }
+
+    func playNextAvailableOffline() {
+        offlineIssue = nil
+        advanceOffline()
+    }
+
+    /// Walks the upcoming list for the first song that is on this device.
+    private func advanceOffline(initialSkipped: Int = 0, excludingFailedCurrent: Bool = false) {
+        offlineScan?.cancel()
+        let requestID = UUID()
+        offlineScanID = requestID
+        resolveGeneration += 1
+        let generation = resolveGeneration
+        let scope = offlineAccountScope
+        var candidates = nextCandidates()
+        if excludingFailedCurrent { candidates.removeAll { $0.origin == .queue(currentIndex) } }
+        engine.replaceCurrentItem(with: nil)
+        releaseCurrentPlaybackResources()
+        isPlaying = false
+        offlineScan = Task { [weak self] in
+            guard let self, !Task.isCancelled, self.offlineScanID == requestID else { return }
+            let selected = try? await OfflineQueueSelector.firstAvailable(candidates, scope: scope,
+                quality: SettingsManager.shared.audioQuality.neteaseLevel, store: .shared,
+                isCached: { await self.isCachedForOffline($0) })
+            guard !Task.isCancelled, self.offlineScanID == requestID, self.resolveGeneration == generation,
+                  self.offlineAccountScope == scope else {
+                if let lease = selected?.lease { try? await OfflineStore.shared.release(lease) }
+                return
+            }
+            self.offlineScan = nil
+            guard let selected else {
+                self.pendingAutoAdvance = false
+                self.offlineIssue = .init(kind: .emptyQueue, trackName: nil)
+                self.isBuffering = false
+                NowPlayingManager.shared.updateElapsed(self.progress, rate: 0)
+                return
+            }
+            // The queue may have been edited while the scan ran.
+            guard self.stillHolds(selected.candidate) else {
+                if let lease = selected.lease { try? await OfflineStore.shared.release(lease) }
+                self.advanceOffline(initialSkipped: initialSkipped, excludingFailedCurrent: excludingFailedCurrent)
+                return
+            }
+            switch selected.candidate.origin {
+            case .inserted(let index): self.playNextList.removeSubrange(0...index)
+            case .queue(let index):
+                if !self.playNextList.isEmpty { self.playNextList.removeAll() }
+                self.currentIndex = index
+            case .fm(let index): self.fmUpcoming.removeSubrange(0...index)
+            }
+            let skipped = initialSkipped + selected.skipped
+            self.pendingAutoAdvance = true
+            self.startPlaying(selected.candidate.track, localLease: selected.lease)
+            if skipped > 0 { ToastCenter.shared.show(String(localized: "已跳过 \(skipped) 首未下载歌曲")) }
+        }
+    }
+
+    /// Whether the song cache can play the track without the network.
+    private func isCachedForOffline(_ trackID: Int) async -> Bool {
+        guard SettingsManager.shared.enableAudioCache else { return false }
+        let allowsThirdParty = SettingsManager.shared.canResolveUnblockedTracks
+        return (try? await AudioCache.shared.fallbackEntry(for: trackID, allowsThirdParty: allowsThirdParty)) != nil
+    }
+
+    private func stillHolds(_ candidate: PlaybackQueueCandidate) -> Bool {
+        switch candidate.origin {
+        case .inserted(let index): return playNextList.indices.contains(index) && playNextList[index].id == candidate.track.id
+        case .queue(let index): return activeQueue.indices.contains(index) && activeQueue[index].id == candidate.track.id
+        case .fm(let index): return fmUpcoming.indices.contains(index) && fmUpcoming[index].id == candidate.track.id
+        }
+    }
+
+    /// Downloads belong to one account. Audio leased under the previous
+    /// account stops, and the offline queue scan starts over.
+    func activateAccount(scope: String?) {
+        guard offlineActivatedScope != scope else { return }
+        offlineActivatedScope = scope
+        offlineScan?.cancel()
+        offlineScan = nil
+        offlineScanID = UUID()
+        offlineIssue = nil
+        scheduleUpdatePrefetch()
+        guard offlinePlaybackLease != nil else { return }
+        resolveGeneration += 1
+        engine.replaceCurrentItem(with: nil)
+        releaseCurrentPlaybackResources()
+        isPlaying = false
+        NowPlayingManager.shared.updateElapsed(progress, rate: 0)
+    }
+
+    // MARK: - Scrobble
+
+    private func scrobbleStartIfNeeded() {
+        guard let track = currentTrack, !startScrobbled else { return }
+        startScrobbled = true
+        let trackID = track.id
+        let sourceID = source.sourceID
+        Task.detached {
+            await MusicAPI.scrobbleStart(trackID: trackID, sourceID: sourceID)
+        }
+    }
+
+    private func scrobbleIfNeeded(completed: Bool) {
+        guard let track = currentTrack, !scrobbled, progress > 1 else { return }
+        scrobbled = true
+        let seconds = completed ? Int(duration) : Int(progress)
+        let sourceID = source.sourceID
+        Task.detached {
+            await MusicAPI.scrobbleFinish(trackID: track.id, sourceID: sourceID, seconds: seconds)
+        }
+    }
+
+    // MARK: - Shuffle helpers
+
+    private func reshuffle(keeping first: Track) {
+        var rest = queue
+        if let index = rest.firstIndex(where: { $0.id == first.id }) { rest.remove(at: index) }
+        rest.shuffle()
+        shuffledQueue = [first] + rest
+    }
+
+    // MARK: - Persistence
+
+    private static let recentContextsLimit = 6
+
+    private func recordRecent(_ context: PlayContext) {
+        recentContexts.removeAll { $0 == context }
+        recentContexts.insert(context, at: 0)
+        if recentContexts.count > Self.recentContextsLimit {
+            recentContexts.removeLast(recentContexts.count - Self.recentContextsLimit)
+        }
+    }
+
+    /// Reloads a place from the recents list and starts playing it again.
+    func play(context: PlayContext) {
+        // Personal FM is a stream, not a fixed list — restart it in place.
+        guard context.kind != .fm else { return startFM() }
+        Task {
+            do {
+                guard let resolved = try await resolve(context) else { return }
+                play(tracks: resolved.tracks, source: resolved.source, context: context)
+            } catch {
+                ToastCenter.shared.show(error.localizedDescription)
+            }
+        }
+    }
+
+    func resolve(_ context: PlayContext) async throws -> (tracks: [Track], source: PlaySource)? {
+        try await OfflineContextResolver.resolve(context, offline: usesOfflineQueue) { try await resolveOnline(context) }
+    }
+
+    private func resolveOnline(_ context: PlayContext) async throws -> (tracks: [Track], source: PlaySource)? {
+        switch context.kind {
+        case .fm:
+            return nil
+        case .album:
+            return (try await MusicAPI.album(id: context.id).songs, .album(context.id))
+        case .artist:
+            return (try await MusicAPI.artist(id: context.id).hotSongs, .artist(context.id))
+        case .daily:
+            return (try await MusicAPI.dailyRecommendSongs(), .daily)
+        case .cloud:
+            let songs = try await MusicAPI.cloudSongs().data?.compactMap(\.simpleSong) ?? []
+            return (songs, .cloud)
+        case .recents:
+            guard let uid = AccountStore.shared.profile?.userId else { return nil }
+            return (try await MusicAPI.playRecords(uid: uid, week: false).map(\.song), .none)
+        case .heartbeat:
+            // Regenerated from a fresh seed, the same way the Home card does it.
+            guard let liked = AccountStore.shared.likedSongsPlaylist,
+                  let seed = AccountStore.shared.likedTrackIDs.randomElement() else { return nil }
+            let tracks = try await MusicAPI.intelligenceList(songID: seed, playlistID: liked.id)
+            return (tracks, .playlist(liked.id))
+        case .search:
+            // Search results are already in hand when played; a saved search
+            // session has no place to reload from, so Recents cannot replay it.
+            return nil
+        case .playlist:
+            let response = try await MusicAPI.playlistDetail(id: context.id)
+            var tracks = response.playlist.tracks
+            // /v6/playlist/detail only carries the first page of tracks.
+            let remaining = response.playlist.trackIds.map(\.id).dropFirst(tracks.count)
+            for chunk in stride(from: 0, to: remaining.count, by: 500)
+                .map({ Array(remaining.dropFirst($0).prefix(500)) }) {
+                guard let more = try? await MusicAPI.songDetails(ids: chunk) else { break }
+                tracks += more.songs
+            }
+            return (tracks, .playlist(context.id))
+        }
+    }
+
+    var playbackSession: PlaybackSession? {
+        guard let currentTrack else { return nil }
+        return PlaybackSession(accountID: playbackAccountID, queue: queue, orderedQueue: activeQueue,
+                               currentIndex: currentIndex, currentTrack: currentTrack, playNext: playNextList,
+                               source: source, repeatMode: repeatMode.rawValue, shuffled: shuffleEnabled,
+                               automaticOrder: false, isFM: isFMMode, progress: progress)
+    }
+
+    func resume(_ session: PlaybackSession) throws {
+        let accountID = AccountStore.shared.authenticatedAccountID
+        try session.validateAccess(accountID: accountID)
+        scrobbleIfNeeded(completed: false)
+        pause()
+        applyPlaybackSession(session)
+        startPlaying(session.currentTrack, resumeAt: session.progress)
+    }
+
+    private func applyPlaybackSession(_ session: PlaybackSession) {
+        // Materialize a Mac AutoMix order on iOS, which has no AutoMix engine.
+        queue = session.automaticOrder ? session.orderedQueue : session.queue
+        shuffledQueue = session.shuffled ? session.orderedQueue : []
+        shuffleEnabled = session.shuffled
+        currentIndex = session.currentIndex
+        currentTrack = session.currentTrack
+        playbackAccountID = session.accountID
+        playNextList = session.playNext
+        source = session.source
+        if let mode = RepeatMode(rawValue: session.repeatMode) { repeatMode = mode }
+        isFMMode = session.isFM
+        fmUpcoming = []
+        progress = session.progress
+        duration = session.currentTrack.duration
+        scrobbled = true
+    }
+
+    func checkpointPlayback() { persistState() }
+
+    func suspendForAccountChange() {
+        resolveGeneration += 1
+        scrobbled = true
+        pause()
+        pendingAudioResourceLoader?.cancel()
+        pendingAudioResourceLoader = nil
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        engine.replaceCurrentItem(with: nil)
+        releaseCurrentPlaybackResources()
+    }
+
+    private func persistState() {
+        lastPlaybackCheckpoint = .now
+        let state = PlaybackState(session: playbackSession, recentContexts: recentContexts)
+        PlaybackStateStorage.save(state, to: Self.stateFileURL)
+    }
+
+    private func restoreState() {
+        guard let data = try? Data(contentsOf: Self.stateFileURL),
+              let state = try? JSONDecoder().decode(PlaybackState.self, from: data)
+        else { return }
+        // Recents outlive the queue: restore them before bailing out on an
+        // empty queue, or the next played track persists an empty list over
+        // them and the Dock menu loses its history for good.
+        recentContexts = Array((state.recentContexts ?? []).prefix(Self.recentContextsLimit))
+        if let session = state.session {
+            do {
+                try session.validate()
+                applyPlaybackSession(session)
+                NowPlayingManager.shared.updateMetadata(for: session.currentTrack, duration: duration)
+            } catch { ToastCenter.shared.show(error.localizedDescription) }
+            return
+        }
+        guard let legacy = state.legacy, !legacy.queue.isEmpty else { return }
+        queue = legacy.queue
+        shuffleEnabled = legacy.shuffle
+        if shuffleEnabled {
+            shuffledQueue = queue.shuffled()
+        }
+        if let id = legacy.currentID,
+           let idx = activeQueue.firstIndex(where: { $0.id == id }) {
+            currentIndex = idx
+            currentTrack = activeQueue[idx]
+            duration = activeQueue[idx].duration
+            NowPlayingManager.shared.updateMetadata(for: activeQueue[idx], duration: duration)
+            Task {
+                await loadLyrics(for: activeQueue[idx], generation: resolveGeneration)
+            }
+        }
+    }
+
+    private static var stateFileURL: URL {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Kumone", isDirectory: true)
+        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        return support.appendingPathComponent("player-state.json")
+    }
+}
+#endif

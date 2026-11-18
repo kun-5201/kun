@@ -1,0 +1,573 @@
+import SwiftUI
+import UniformTypeIdentifiers
+#if os(macOS)
+import Combine
+#endif
+
+#if os(iOS)
+/// The iOS Settings sheet: its navigation stack, title and 完成 button around
+/// `SettingsView`. Present it from the app's root (`presentSettingsSheet`).
+///
+/// Presented from inside the Library tab, the sheet was re-hosted whenever
+/// the tab view updated, so changing a setting from a pushed page (picking a
+/// sound effect, say) reset the stack and popped the page back to the root.
+/// It also keeps the stack apart from `SettingsView`, which re-renders on
+/// every settings change.
+struct SettingsSheet: View {
+    var titleDisplayMode: NavigationBarItem.TitleDisplayMode = .automatic
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.openDestination) private var openDestination
+    @State private var path: [SettingsView.SettingsPage] = []
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            SettingsView()
+                .navigationTitle("设置")
+                .navigationBarTitleDisplayMode(titleDisplayMode)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("完成") { dismiss() }
+                    }
+                }
+                .navigationDestination(for: SettingsView.SettingsPage.self) { page in
+                    switch page {
+                    case .storage:
+                        StorageSpaceView {
+                            dismiss()
+                            openDestination(.downloaded)
+                        }
+                    case .lyrics:
+                        LyricsSettingsPage()
+                    case .luoxueSources:
+                        LXSourceManagerView()
+                    case .soundEffects:
+                        SoundEffectsPage()
+                    }
+                }
+        }
+    }
+}
+#endif
+
+struct SettingsView: View {
+    @EnvironmentObject private var settings: SettingsManager
+    @EnvironmentObject private var account: AccountStore
+    @State private var showLiveActivityAlert = false
+    @State private var liveActivityAlertMessage = ""
+    @State private var islandLogShareURL: URL?
+    @AppStorage("moumusic.netease.autoSignIn") private var neteaseAutoSignIn = true
+    #if os(iOS)
+    @ObservedObject private var lxStore = LXSourceStore.shared
+    #endif
+    @Environment(\.openDestination) private var openDestination
+    #if os(macOS)
+    @AppStorage(SettingsManager.Keys.menuBarPlayer) private var showMenuBarPlayer = false
+    @State private var navigationPath: [SettingsPage] = []
+    #endif
+
+    #if os(iOS)
+    /// One-line summary of the installed LX sources, shown on the
+    /// 自定义源管理 row.
+    private var luoxueSummaryText: String {
+        let entries = lxStore.sources
+        if entries.isEmpty { return String(localized: "未导入") }
+        let enabled = entries.filter { lxStore.isEnabled($0.id) }.count
+        return String(localized: "\(entries.count) 个源，\(enabled) 个启用")
+    }
+    #else
+    private var luoxueSummaryText: String { String(localized: "未导入") }
+    #endif
+
+    fileprivate enum SettingsPage: Hashable {
+        case storage
+        case lyrics
+        #if os(iOS)
+        case luoxueSources
+        #endif
+        #if os(iOS)
+        case soundEffects
+        #endif
+        #if os(macOS)
+        case shortcuts
+        #endif
+    }
+
+    var body: some View {
+        #if os(macOS)
+        NavigationStack(path: $navigationPath) { settingsForm }
+            .toolbar {
+                if !navigationPath.isEmpty {
+                    ToolbarItem(placement: .navigation) {
+                        Button {
+                            _ = navigationPath.popLast()
+                        } label: {
+                            Label("返回", systemImage: "chevron.backward")
+                        }
+                        .labelStyle(.iconOnly)
+                    }
+                }
+            }
+            .background(SettingsWindowToolbar(onClose: { navigationPath.removeAll() }))
+            .frame(width: 520, height: 620)
+            .overlay(alignment: .top) { SettingsToastOverlay() }
+        #else
+        // Navigation lives in `SettingsSheet`, which observes no settings.
+        settingsForm
+        #endif
+    }
+
+    private var settingsForm: some View {
+        Form {
+            Section("播放") {
+                Picker("播放来源", selection: $settings.playbackSourceMode) {
+                    ForEach(PlaybackSourceMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+#if os(iOS)
+                .pickerStyle(.segmented)
+#endif
+                Text(settings.playbackSourceMode.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("默认播放音质", selection: Binding(
+                    get: { settings.audioQuality },
+                    set: { settings.audioQuality = $0; QualitySupport.rememberChoice($0) }
+                )) {
+                    ForEach(AudioQuality.allCases) { quality in
+                        Text("\(quality.displayName) · \(quality.sourceDisplayName)")
+                            .tag(quality)
+                    }
+                }
+                Text("自动模式先尝试已登录账号的官方音源；账号不可用或只返回试听片段时，再按顺序回退到已启用的 LX 第三方音源。最终显示以接口实际返回的音质为准，不会把请求档位当成真实音质；下载使用播放音质，不再单独设置。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                #if os(iOS)
+                NavigationLink(value: SettingsPage.soundEffects) {
+                    HStack {
+                        Text("音效")
+                        Spacer()
+                        Text(settings.soundEffectPreset.displayName)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityValue(settings.soundEffectPreset.displayName)
+                .accessibilityIdentifier("settingsSoundEffectsButton")
+                #endif
+                Toggle("灰色歌曲解锁", isOn: $settings.enableUnblock)
+                Text("无版权或下架歌曲将通过落雪自定义源匹配播放")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("网易云每日自动签到", isOn: $neteaseAutoSignIn)
+                Text("每天首次打开 App 时，用当前登录的网易云账号自动签到一次（安卓 + 网页，两次共最多 5 点经验）。关闭后不再自动签到。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            #if os(macOS)
+
+            AutoMixSettingsSection()
+            #endif
+
+            #if os(iOS)
+            // The custom-source section is always visible — the LX script
+            // is the only music source left in the app, so hiding its entry
+            // behind another toggle made the app look like it had no source
+            // management at all.
+            Section("自定义源") {
+                NavigationLink(value: SettingsPage.luoxueSources) {
+                    HStack {
+                        Label("自定义源管理", systemImage: "music.note.list")
+                        Spacer()
+                        Text(luoxueSummaryText)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .accessibilityIdentifier("settingsLuoxueSourcesButton")
+                Text("导入兼容 lx-music 格式的第三方音源脚本，支持本地批量导入与在线直链导入。脚本仅在本机运行，用于解析无版权或试听歌曲的播放地址。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            #endif
+
+            // Flutify lyrics settings entry — always visible, never hidden.
+            Section("歌词") {
+                NavigationLink(value: SettingsPage.lyrics) {
+                    Label("歌词设置", systemImage: "text.quote")
+                }
+#if os(iOS)
+                // #59: island mode picker (Kugou-style) replaces the
+                // on/off "歌词上岛" toggle. Lyrics = the lyric island;
+                // playlist = the queue island (the pill shows the
+                // scrolling "长按开启歌词" hint; the expanded view has
+                // the "点击开启歌词" button). Off = no island at all.
+                // The gate is unchanged: the island only starts after
+                // the user picks a mode, never automatically.
+                Picker("灵动岛模式", selection: Binding(
+                    get: { settings.islandMode },
+                    set: { newMode in
+                        if newMode == .off {
+                            settings.islandMode = .off
+                            LyricsLiveActivityManager.shared.disable()
+                            return
+                        }
+                        Task { @MainActor in
+                            switch LyricsLiveActivityManager.shared.authorizationStatus() {
+                            case .granted:
+                                settings.islandMode = newMode
+                                PlayerService.shared.refreshLyricsIsland()
+                                // "更频繁更新" off only throttles refreshes — it must
+                                // not block the mode (that left the island black
+                                // with no feedback). Enable anyway and warn.
+                                if !LyricsLiveActivityManager.shared.frequentUpdatesEnabled {
+                                    liveActivityAlertMessage = "实时活动已开启，但「更频繁更新」未开启，歌词更新会被系统节流、可能停住。灵动岛已开启，建议在系统设置中为 Kumone 开启「更频繁更新」。"
+                                    showLiveActivityAlert = true
+                                }
+                            case .needsSettings(let reason):
+                                liveActivityAlertMessage = reason
+                                showLiveActivityAlert = true
+                            }
+                        }
+                    }
+                )) {
+                    ForEach(SettingsManager.IslandMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text("歌词：在灵动岛与锁屏显示当前歌词；歌单：在灵动岛与锁屏显示播放队列。关闭后立即从灵动岛与锁屏消失。默认关闭，不会自动开启。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if settings.lyricsOnIsland {
+                    Toggle("位置保活（实验性）", isOn: Binding(
+                        get: { settings.lyricsIslandLocationKeepAlive },
+                        set: { newValue in
+                            settings.lyricsIslandLocationKeepAlive = newValue
+                            if newValue {
+                                LyricsLiveActivityManager.shared.requestLocationAuthorizationIfNeeded()
+                            }
+                        }
+                    ))
+                    Text("后台定位保持应用活跃，可能减缓歌词停住，但会耗电，且不能保证苹果不节流更新；App Store 可能以“后台定位仅作保活”为由拒绝。仅在灵动岛运行时定位，停止即停。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("刷新灵动岛歌词") {
+                        PlayerService.shared.refreshLyricsIsland()
+                    }
+                    Text("灵动岛停住时点此重新发布当前歌词行，无需重启播放。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    // Diagnostics: one glance that separates "toggle off" /
+                    // "system refused" / "activity never started". Values are
+                    // read when the page renders; re-enter the page to refresh.
+                    Group {
+                        Text("灵动岛状态")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        Text("系统实时活动：\(LyricsLiveActivityManager.shared.authorizationStatus() == .granted ? "已开启" : "未开启")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("更频繁更新：\(LyricsLiveActivityManager.shared.frequentUpdatesEnabled ? "已开启" : "未开启")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("歌词活动：\(LyricsLiveActivityManager.shared.isActivityRunning ? "运行中" : "未启动")")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if let failure = LyricsLiveActivityManager.shared.lastIslandFailure {
+                            Text("最近记录：\(failure)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Button("导出诊断日志") {
+                            let url = FileManager.default.temporaryDirectory
+                                .appendingPathComponent("kun-diagnostic-log.json")
+                            try? DiagnosticLogStore.shared.exportData().write(to: url)
+                            islandLogShareURL = url
+                        }
+                        if let islandLogShareURL {
+                            ShareLink(item: islandLogShareURL) {
+                                Label("分享诊断日志", systemImage: "square.and.arrow.up")
+                            }
+                        }
+                        Text("状态在打开设置页时读取；改完开关后返回重进一次即刷新。诊断日志只含应用自己写的记录，不含系统崩溃报告。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+#endif
+                Toggle("显示歌词翻译", isOn: $settings.showLyricsTranslation)
+                Picker("日文歌词读音", selection: $settings.lyricsAnnotation) {
+                    ForEach(LyricsAnnotation.allCases) { annotation in
+                        Text(annotation.displayName).tag(annotation)
+                    }
+                }
+            }
+            .alert("需要开启实时活动", isPresented: $showLiveActivityAlert) {
+                Button("去设置") { LyricsLiveActivityManager.shared.openSystemSettings() }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text(liveActivityAlertMessage)
+            }
+
+            Section("外观") {
+                Picker("主题", selection: $settings.appearance) {
+                    ForEach(AppAppearance.allCases) { appearance in
+                        Text(appearance.displayName).tag(appearance)
+                    }
+                }
+                #if os(macOS)
+                // macOS only renders two now-playing layouts — 黑胶 and the
+                // regular page; the iOS 沉浸/简洁 options all fall back to the
+                // regular page here, so offering four was misleading (#105).
+                // Map any non-vinyl value onto 经典模式 so a stored default (e.g.
+                // 沉浸模式) still shows a valid selection.
+                Picker("播放页模式", selection: Binding(
+                    get: { settings.nowPlayingMode == .vinyl ? .vinyl : .classic },
+                    set: { settings.nowPlayingMode = $0 }
+                )) {
+                    Text(NowPlayingMode.vinyl.displayName).tag(NowPlayingMode.vinyl)
+                    Text(NowPlayingMode.classic.displayName).tag(NowPlayingMode.classic)
+                }
+                #else
+                Picker("播放页模式", selection: $settings.nowPlayingMode) {
+                    ForEach(NowPlayingMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                Picker("横屏播放页样式", selection: $settings.landscapeNowPlayingStyle) {
+                    ForEach(LandscapeNowPlayingStyle.allCases) { style in
+                        Text(style.displayName).tag(style)
+                    }
+                }
+                Text("iPhone 横放或 iPad 打开播放页时使用；竖屏仍按上面的「播放页模式」")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                #endif
+                Toggle("点击封面打开专辑", isOn: $settings.openAlbumOnArtworkClick)
+                Toggle("主界面环境色", isOn: $settings.showMainWindowAmbientBackground)
+                if settings.showMainWindowAmbientBackground {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("背景色强度")
+                            Spacer()
+                            Text("\(Int(settings.mainWindowAmbientBackgroundIntensity * 100))%")
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(
+                            value: $settings.mainWindowAmbientBackgroundIntensity,
+                            in: SettingsManager.mainWindowAmbientBackgroundIntensityRange,
+                            step: 0.1
+                        )
+                        HStack {
+                            Text("50%")
+                            Spacer()
+                            Text("150%")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                #if os(macOS)
+                Toggle("桌面歌词", isOn: $settings.showDesktopLyrics)
+                if settings.showDesktopLyrics {
+                    Toggle("桌面歌词水平居中", isOn: $settings.desktopLyricsCentered)
+                }
+                Text("在屏幕上悬浮显示当前歌词，可拖动调整位置")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                #endif
+            }
+
+            Section("存储") {
+                NavigationLink(value: SettingsPage.storage) {
+                    Label("存储空间", systemImage: "internaldrive")
+                }
+            }
+
+            #if os(macOS)
+            Section("通用") {
+                Toggle("在菜单栏显示", isOn: $showMenuBarPlayer)
+                NavigationLink(value: SettingsPage.shortcuts) {
+                    Label("快捷键", systemImage: "keyboard")
+                }
+            }
+            #endif
+
+            SyncSettingsSection()
+
+            Section("账号") {
+                if let profile = account.profile {
+                    LabeledContent("当前账号", value: profile.nickname)
+                    Button("退出登录", role: .destructive) {
+                        Task {
+                            do { try await AccountStore.shared.logout() }
+                            catch { ToastCenter.shared.show(error.localizedDescription) }
+                        }
+                    }
+                } else {
+                    Text("未登录")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if showsUpdateControls {
+                Section("更新") {
+                    Toggle("启动时自动检查更新", isOn: $settings.autoCheckUpdates)
+                    Text("关闭后启动不再自动弹出更新提示，仍可手动检查更新")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    #if os(iOS)
+                    if DistributionChannel.current == .sideload {
+                        Button {
+                            IOSUpdater.shared.check(interactive: true)
+                        } label: {
+                            Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        Text("装有 TrollStore（巨魔）可在应用内一键自动安装；否则可下载 IPA 用侧载工具重装（登录状态与设置保留）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    #endif
+                }
+            }
+
+            Section {
+                VStack(spacing: 2) {
+                    Text("Kumone")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Text(appVersionAndBuild)
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 24)
+                .padding(.bottom, 32)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(appVersionAccessibilityLabel)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            }
+        }
+        .formStyle(.grouped)
+        #if os(macOS)
+        .navigationDestination(for: SettingsPage.self) { page in
+            Group {
+                switch page {
+                case .storage:
+                    StorageSpaceView {
+                        openDestination(.downloaded)
+                    }
+                case .lyrics:
+                    LyricsSettingsPage()
+                case .shortcuts:
+                    ShortcutSettingsView()
+                }
+            }
+            .navigationBarBackButtonHidden()
+            .toolbar(removing: .title)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    switch page {
+                    case .storage: Text("存储空间").font(.headline)
+                    case .lyrics: Text("歌词").font(.headline)
+                    case .shortcuts: Text("快捷键").font(.headline)
+                    }
+                }
+            }
+        }
+        #endif
+    }
+
+    /// Sparkle on macOS; on iOS only sideload builds carry an updater.
+    private var showsUpdateControls: Bool {
+        #if os(iOS)
+        return DistributionChannel.current.allowsSelfUpdate
+        #else
+        return true
+        #endif
+    }
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
+
+    private var appBuild: String? {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String
+    }
+
+    /// "0.1.0 (2)": version, then build in brackets, both read from the bundle.
+    private var appVersionAndBuild: String {
+        guard let build = appBuild, !build.isEmpty else { return appVersion }
+        return "\(appVersion) (\(build))"
+    }
+
+    private var appVersionAccessibilityLabel: String {
+        if let build = appBuild, !build.isEmpty {
+            return "Kumone, version \(appVersion), build \(build)"
+        }
+        return "Kumone, version \(appVersion)"
+    }
+
+}
+
+#if os(macOS)
+private struct SettingsToastOverlay: View {
+    @ObservedObject private var toasts = ToastCenter.shared
+
+    var body: some View {
+        Group {
+            if let toast = toasts.current {
+                ToastView(toast: toast)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .padding(.top, 12)
+                    .accessibilityAddTraits(.updatesFrequently)
+            }
+        }
+        .animation(.spring(duration: 0.3), value: toasts.current)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Keep navigation and the title in the native, compact titlebar toolbar.
+/// Settings scenes retain their view state when closed, so reset the path here.
+struct SettingsWindowToolbar: NSViewRepresentable {
+    let onClose: () -> Void
+
+    func makeNSView(context: Context) -> ToolbarHost {
+        let view = ToolbarHost()
+        view.onClose = onClose
+        return view
+    }
+
+    func updateNSView(_ nsView: ToolbarHost, context: Context) {
+        nsView.onClose = onClose
+        nsView.updateToolbar()
+    }
+
+    final class ToolbarHost: NSView {
+        var onClose: () -> Void = {}
+        private var closeObserver: AnyCancellable?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            closeObserver = window.map { window in
+                NotificationCenter.default.publisher(for: NSWindow.willCloseNotification, object: window)
+                    .sink { [weak self] _ in self?.onClose() }
+            }
+            updateToolbar()
+        }
+
+        func updateToolbar() {
+            guard let window, window.toolbarStyle != .unifiedCompact else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let window = self?.window, window.toolbarStyle != .unifiedCompact else { return }
+                window.toolbarStyle = .unifiedCompact
+            }
+        }
+    }
+}
+#endif
