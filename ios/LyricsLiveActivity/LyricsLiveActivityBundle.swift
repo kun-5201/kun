@@ -219,18 +219,23 @@ struct LyricsLiveActivity: Widget {
                 IslandCoverThumbnailSync(size: 28, coverURL: context.state.coverURL)
                     .widgetURL(URL(string: "kumone://now-playing")!)
             } minimal: {
-                // #59: the user wants the lyric in the minimal view too.
-                // Minimal holds exactly one element; the lyric wins over
-                // the cover (the 04:43 screenshot's right pill was the
-                // minimal view showing cover only, no lyric). Same
-                // 3-char scrolling window as compactLeading. The "·60"
+                // #61: the user pointed at the MINIMIZED pill ("改缩小
+                // 的那里", not the expanded view): 3 footnote
+                // characters did not fit in the tiny minimized pill,
+                // so the system clipped them (fewer than 3 chars
+                // visible). Same 3-char scrolling window as
+                // compactLeading, but at caption2 (11pt) so 3
+                // characters fit, with minimumScaleFactor as a safety
+                // net — the lyric is the priority, still scrolling
+                // (never static), still 3 complete chars. The "·60"
                 // marker is NOT here — minimal holds exactly one
                 // element and the lyric is the priority; the marker is
                 // proven by compactLeading + the expanded diagnostic.
                 // Tapping opens the player.
                 Marquee3Char(
                     text: compactLine(state: context.state),
-                    color: Color(hex: context.state.lyricColorHex)
+                    color: Color(hex: context.state.lyricColorHex),
+                    font: .caption2
                 )
                 .widgetURL(URL(string: "kumone://now-playing")!)
             }
@@ -487,16 +492,26 @@ struct Marquee3Char: View {
     /// Seconds per step (1 char). 1s is the cadence Live Activities
     /// can actually honor; 0.05s (#59) was throttled/frozen.
     var stepSeconds: TimeInterval = 1.0
+    /// Font for the scrolling text. Compact uses footnote (default,
+    /// so its call site is untouched); minimal (#61) passes caption2
+    /// so 3 characters fit in the tiny minimized pill.
+    var font: Font = .footnote
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: stepSeconds)) { timeline in
             Text(Self.window(
                 text: text, at: timeline.date,
                 windowSize: windowSize, stepSeconds: stepSeconds))
-                .font(.footnote)
+                .font(font)
                 .fontWeight(.semibold)
                 .foregroundStyle(color)
                 .lineLimit(1)
+                // #61: shrink slightly rather than truncate, so 3
+                // complete characters always show even when the
+                // system gives the view less width than the text
+                // needs (the tiny minimal pill). Compact has ample
+                // width, so this never triggers there.
+                .minimumScaleFactor(0.8)
         }
     }
 
