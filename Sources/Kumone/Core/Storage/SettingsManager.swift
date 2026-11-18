@@ -893,7 +893,12 @@ final class SettingsManager: ObservableObject {
         } else {
             islandMode = .off
         }
-        defaults.set(islandMode.rawValue, forKey: Keys.lyricsIslandMode)
+        // NOTE: do NOT read islandMode back here (e.g. to persist the
+        // migrated value): init has not finished assigning every stored
+        // property yet, and Swift forbids any self read before that.
+        // Persisting is unnecessary — the old bool key stays, so the
+        // migration re-runs identically on the next launch, and the
+        // didSet writes the mode as soon as the user changes it.
         lyricsIslandNudgeShown = defaults.object(forKey: Keys.lyricsIslandNudgeShown) as? Bool ?? false
         lyricsIslandLocationKeepAlive = defaults.object(forKey: Keys.lyricsIslandLocationKeepAlive) as? Bool ?? false
         #if os(macOS)
