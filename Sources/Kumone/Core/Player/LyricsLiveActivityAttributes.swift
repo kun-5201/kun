@@ -85,6 +85,15 @@ public struct LyricsLiveActivityAttributes: ActivityAttributes {
         /// #59: whether the current track is in the user's liked songs.
         /// Drives the expanded view's heart icon (filled when liked).
         public var isLiked: Bool
+        /// #62: the track definitively has NO lyrics (all sources
+        /// returned empty, not still loading). The extension then shows
+        /// the song-title marquee in the pill and "纯音乐 · 歌手名" in
+        /// the expanded view — and NO "点击开启歌词" button (it is not
+        /// switched off, there is nothing to enable). False while
+        /// lyrics are still loading (title fallback shows instead) and
+        /// for any track with lyrics. Optional-default keeps old states
+        /// decodable.
+        public var isPureMusic: Bool
 
         public init(
             title: String,
@@ -102,7 +111,8 @@ public struct LyricsLiveActivityAttributes: ActivityAttributes {
             isPlaylistMode: Bool = false,
             queueTitles: [String]? = nil,
             repeatMode: String = "off",
-            isLiked: Bool = false
+            isLiked: Bool = false,
+            isPureMusic: Bool = false
         ) {
             self.title = title
             self.artist = artist
@@ -120,6 +130,7 @@ public struct LyricsLiveActivityAttributes: ActivityAttributes {
             self.queueTitles = queueTitles
             self.repeatMode = repeatMode
             self.isLiked = isLiked
+            self.isPureMusic = isPureMusic
         }
     }
 

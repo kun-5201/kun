@@ -161,6 +161,13 @@ final class PlayerService: ObservableObject {
     /// surfaced as "Recently Played" in the Dock menu.
     @Published private(set) var recentContexts: [PlayContext] = []
     @Published private(set) var lyrics: ParsedLyrics?
+    /// #62: the current track definitively has NO lyrics — all sources
+    /// returned empty (fresh or cached negative), not a network error.
+    /// While a resolve is still in flight or retrying after a network
+    /// error this stays false, so the island keeps the title fallback
+    /// instead of claiming pure music. Read by
+    /// LyricsLiveActivityManager.lyricDidChange → ContentState.isPureMusic.
+    @Published private(set) var noLyricsConfirmed = false
     @Published var activePanel: RightPanel?
     @Published var showNowPlaying = false
 
@@ -823,6 +830,9 @@ final class PlayerService: ObservableObject {
         itemStatusObservation = nil
         isTrial = false
         lyrics = nil
+        // #62: new track, lyrics unknown again — the flag is only set
+        // when this track's resolve comes back definitively empty.
+        noLyricsConfirmed = false
         lyricsRetryTask?.cancel()
         lyricsRetryTask = nil
         lyricsRetryCount = 0
@@ -1437,10 +1447,21 @@ final class PlayerService: ObservableObject {
             // network failure while the same song is still playing.
             logLyricsOutcome(outcome, track: track)
             scheduleLyricsRetryIfNeeded(for: track, generation: generation, outcome: outcome)
+            // #62: definitive "no lyrics anywhere" (fresh or cached
+            // negative — NOT a network error, which keeps retrying):
+            // the track is pure music. Tell the island so the pill
+            // shows the title marquee and the expanded view shows
+            // "纯音乐" instead of the enable button. The cursor push
+            // below carries the flipped flag to the island.
+            if !outcome.networkError {
+                noLyricsConfirmed = true
+                updateLyricsCursor(at: progress)
+            }
             return
         }
         lyricsRetryCount = 0
         logLyricsOutcome(outcome, track: track)
+        noLyricsConfirmed = false
         lyrics = resolved.parsed
         updateLyricsCursor(at: progress)
     }

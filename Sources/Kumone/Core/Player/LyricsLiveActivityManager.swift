@@ -474,7 +474,12 @@ public final class LyricsLiveActivityManager: ObservableObject {
             isPlaylistMode: SettingsManager.shared.islandMode == .playlist,
             queueTitles: SettingsManager.shared.islandMode == .playlist ? upcomingQueueTitles() : nil,
             repeatMode: PlayerService.shared.repeatMode.rawValue,
-            isLiked: AccountStore.shared.isLiked(track.id)
+            isLiked: AccountStore.shared.isLiked(track.id),
+            // #62: pure music — the track's resolve came back
+            // definitively empty (all sources, not still loading).
+            // While loading, or after a network error, this is false
+            // and the island keeps the title fallback.
+            isPureMusic: PlayerService.shared.noLyricsConfirmed
         )
         guard state != lastState else { return }
         let oldState = lastState
@@ -526,7 +531,12 @@ public final class LyricsLiveActivityManager: ObservableObject {
         let queueChanged = state.queueTitles != oldState?.queueTitles
         let controlsChanged = state.repeatMode != oldState?.repeatMode
             || state.isLiked != oldState?.isLiked
-        guard linesChanged || isNewTrack || modeChanged || queueChanged || controlsChanged || activity == nil else { return }
+        // #62: pure-music flip (loading → confirmed no lyrics) must
+        // push even though the lines are unchanged — the title was
+        // already the fallback, so without this the pill keeps the
+        // title and the expanded view never learns to show "纯音乐".
+        let pureMusicChanged = state.isPureMusic != oldState?.isPureMusic
+        guard linesChanged || isNewTrack || modeChanged || queueChanged || controlsChanged || pureMusicChanged || activity == nil else { return }
         lastPublishedLines = (safePrevious, safeCurrent, safeNext)
         scheduleDebouncedPush(state: state)
     }
